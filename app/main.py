@@ -3,8 +3,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import Base, engine
-from app.models import user, api_key, audit_log  # Ensure models are registered with Base
-from app.api.v1 import auth, admin
+from app.models import user, api_key, audit_log, campaign, article  # Ensure all models are registered
+from app.api.v1 import auth, admin, tools
 
 
 @asynccontextmanager
@@ -46,6 +46,7 @@ app.add_middleware(
 # Include API v1 routers
 app.include_router(auth.router, prefix=settings.API_V1_STR)
 app.include_router(admin.router, prefix=settings.API_V1_STR)
+app.include_router(tools.router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Health"])
