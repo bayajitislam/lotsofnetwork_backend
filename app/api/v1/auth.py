@@ -4,9 +4,20 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models.user import User
-from app.schemas.auth import GoogleAuthRequest, TokenResponse, UserResponse
+from app.schemas.auth import (
+    GoogleAuthRequest,
+    RefreshTokenRequest,
+    TokenResponse,
+    TokenRefreshResponse,
+    LogoutResponse,
+    UserResponse,
+)
 from app.services.google_auth import verify_google_id_token
-from app.services.security import create_access_token
+from app.services.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_refresh_token,
+)
 from app.api.deps import get_current_user
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -19,7 +30,8 @@ def sign_in_with_google(
 ):
     """
     Authenticates a user via Google ID token.
-    Automatically provisions regular user accounts or admin accounts based on ADMIN_EMAILS whitelist.
+    Automatically assigns role (admin or user) based on dynamic ADMIN_EMAILS check.
+    Returns short-lived access token and long-lived refresh token.
     """
     # 1. Verify Google ID token
     google_data = verify_google_id_token(payload.credential)
@@ -38,18 +50,15 @@ def sign_in_with_google(
     now = datetime.now(timezone.utc)
 
     if user:
-        # Update user profile information & last login
         user.name = name or user.name
         user.avatar = picture or user.avatar
         user.google_id = google_id
         user.last_login_at = now
-        # Elevate to admin if in whitelist and not already admin
-        if is_admin and user.role != "admin":
-            user.role = "admin"
+        # Dynamic Role Reconciliation (Supports both elevation and demotion)
+        user.role = target_role
         db.commit()
         db.refresh(user)
     else:
-        # Create new user
         user = User(
             email=email,
             name=name,
@@ -57,6 +66,7 @@ def sign_in_with_google(
             google_id=google_id,
             role=target_role,
             is_active=True,
+            token_version=1,
             created_at=now,
             last_login_at=now,
         )
@@ -70,19 +80,92 @@ def sign_in_with_google(
             detail="Your account has been deactivated. Please contact support.",
         )
 
-    # 4. Generate JWT access token
+    # 4. Generate Access and Refresh Tokens
     token_claims = {
         "sub": user.id,
         "email": user.email,
         "role": user.role,
+        "ver": user.token_version,
     }
     access_token = create_access_token(data=token_claims)
+    refresh_token = create_refresh_token(data={"sub": user.id, "ver": user.token_version})
 
     return TokenResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
         user=UserResponse.model_validate(user),
     )
+
+
+@router.post("/refresh", response_model=TokenRefreshResponse, summary="Refresh expired access token")
+def refresh_access_token(
+    payload: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Exchanges a valid refresh token for a fresh short-lived access token.
+    Validates token version against the user record for instant revocation.
+    """
+    decoded = decode_refresh_token(payload.refresh_token)
+    if not decoded:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = decoded.get("sub")
+    token_ver = decoded.get("ver")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account has been deactivated.",
+        )
+
+    # Validate token version
+    if token_ver != user.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has been revoked. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Issue new access token
+    new_claims = {
+        "sub": user.id,
+        "email": user.email,
+        "role": user.role,
+        "ver": user.token_version,
+    }
+    new_access_token = create_access_token(data=new_claims)
+
+    return TokenRefreshResponse(
+        access_token=new_access_token,
+        token_type="bearer",
+    )
+
+
+@router.post("/logout", response_model=LogoutResponse, summary="Revoke all active sessions (Global Logout)")
+def logout(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Increments token_version in the database, invalidating all issued access
+    and refresh tokens across all devices immediately.
+    """
+    current_user.token_version += 1
+    db.commit()
+    return LogoutResponse()
 
 
 @router.get("/me", response_model=UserResponse, summary="Get current authenticated user profile")

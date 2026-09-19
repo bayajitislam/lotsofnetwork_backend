@@ -1,5 +1,5 @@
-from typing import Generator
-from fastapi import Depends, HTTPException, status
+from typing import Optional
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -30,6 +30,8 @@ def get_current_user(
         )
 
     user_id = payload.get("sub")
+    token_ver = payload.get("ver")
+
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -47,7 +49,15 @@ def get_current_user(
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is deactivated.",
+            detail="User account has been deactivated.",
+        )
+
+    # Security Check: Verify token version matches user.token_version (Global revocation)
+    if token_ver is not None and token_ver != user.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has been revoked. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     return user
@@ -59,10 +69,21 @@ def require_user(current_user: User = Depends(get_current_user)) -> User:
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """Dependency verifying the user has the 'admin' role."""
+    """Dependency strictly verifying the user has the 'admin' role."""
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access forbidden: Administrator privileges required.",
         )
     return current_user
+
+
+def get_client_info(request: Request) -> tuple[str, str]:
+    """Helper to extract client IP and user agent for audit logging."""
+    ip = request.client.host if request.client else "unknown"
+    # Check X-Forwarded-For if behind a reverse proxy (e.g. Cloudflare / NGINX)
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+    ua = request.headers.get("user-agent", "unknown")[:500]
+    return ip, ua

@@ -1,6 +1,6 @@
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, Boolean, DateTime, Integer
 from app.database import Base
 
 
@@ -14,5 +14,6 @@ class User(Base):
     google_id = Column(String(255), unique=True, index=True, nullable=False)
     role = Column(String(32), default="user", nullable=False)  # "admin" | "user"
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    last_login_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    token_version = Column(Integer, default=1, nullable=False)  # Incremented to revoke all active tokens
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_login_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)

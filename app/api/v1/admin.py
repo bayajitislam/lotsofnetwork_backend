@@ -1,12 +1,14 @@
+import json
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.models.api_key import ApiKey
-from app.schemas.auth import UserResponse
-from app.api.deps import require_admin
+from app.models.audit_log import AuditLog
+from app.schemas.auth import UserResponse, AuditLogResponse
+from app.api.deps import require_admin, get_client_info
 
 router = APIRouter(prefix="/admin", tags=["Admin Portal"])
 
@@ -16,11 +18,13 @@ class AdminStatsResponse(BaseModel):
     admin_users: int
     standard_users: int
     active_api_keys: int
+    audit_logs_count: int
     status: str = "healthy"
 
 
 class UserStatusUpdateRequest(BaseModel):
     is_active: bool
+    reason: Optional[str] = "Admin status update"
 
 
 @router.get("/stats", response_model=AdminStatsResponse, summary="Get Admin Overview Statistics")
@@ -35,12 +39,14 @@ def get_admin_stats(
     admin_users = db.query(User).filter(User.role == "admin").count()
     standard_users = db.query(User).filter(User.role == "user").count()
     active_api_keys = db.query(ApiKey).filter(ApiKey.is_active == True).count()
+    audit_logs_count = db.query(AuditLog).count()
 
     return AdminStatsResponse(
         total_users=total_users,
         admin_users=admin_users,
         standard_users=standard_users,
         active_api_keys=active_api_keys,
+        audit_logs_count=audit_logs_count,
         status="healthy",
     )
 
@@ -67,11 +73,13 @@ def list_users(
 def update_user_status(
     user_id: str,
     payload: UserStatusUpdateRequest,
+    request: Request,
     admin_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """
-    Enables or disables a user account. Cannot disable own admin account. Requires Admin role.
+    Enables or disables a user account and records an immutable audit trail.
+    Cannot disable own admin account. Requires Admin role.
     """
     if user_id == admin_user.id and not payload.is_active:
         raise HTTPException(
@@ -86,7 +94,51 @@ def update_user_status(
             detail="User not found.",
         )
 
+    old_status = target_user.is_active
     target_user.is_active = payload.is_active
+    # If deactivating, revoke all sessions
+    if not payload.is_active:
+        target_user.token_version += 1
+
+    # Security Audit Trail
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="USER_DEACTIVATED" if not payload.is_active else "USER_ACTIVATED",
+        resource_type="user",
+        resource_id=target_user.id,
+        details=json.dumps({
+            "target_email": target_user.email,
+            "old_status": old_status,
+            "new_status": payload.is_active,
+            "reason": payload.reason,
+        }),
+        ip_address=ip,
+        user_agent=ua,
+    )
+    db.add(audit)
     db.commit()
     db.refresh(target_user)
+
     return UserResponse.model_validate(target_user)
+
+
+@router.get("/audit-logs", response_model=List[AuditLogResponse], summary="Retrieve Admin Security Audit Logs")
+def get_audit_logs(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Lists administrative audit logs for compliance and security monitoring. Requires Admin role.
+    """
+    logs = (
+        db.query(AuditLog)
+        .order_by(AuditLog.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    return [AuditLogResponse.model_validate(log) for log in logs]
