@@ -19,6 +19,9 @@ from app.models.tag import Tag
 from app.models.article import Article
 from app.models.tool_run import ToolRun
 from app.models.crash_log import CrashLog
+from app.models.plan import Plan
+from app.models.subscription import Subscription
+from app.api.v1.billing import ensure_default_plans
 from app.api.v1.tools import ALL_22_TOOLS_METADATA
 from app.schemas.auth import UserResponse, AuditLogResponse
 from app.schemas.api_key import ApiKeyResponse, ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeyUpdateRequest
@@ -60,10 +63,65 @@ class AdminStatsResponse(BaseModel):
     avg_ctr: float
     total_earnings: float
     api_revenue: float
-    ad_target_percentage: int
+    total_subscriptions: int = 0
+    paid_subscribers: int = 0
+    ad_target_percentage: int = 68
     monthly_activity: List[MonthlyActivityItem]
     revenue_breakdown: RevenueBreakdown
     status: str = "healthy"
+
+
+class AdminSubscriptionItem(BaseModel):
+    id: str
+    user_id: str
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    user_avatar: Optional[str] = None
+    plan_id: str
+    plan_name: str
+    plan_slug: str
+    monthly_limit: int
+    rate_limit_rpm: int
+    price_cents: int
+    stripe_customer_id: Optional[str] = None
+    stripe_subscription_id: Optional[str] = None
+    status: str
+    current_period_start: Optional[datetime] = None
+    current_period_end: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AdminSubscriptionUpdate(BaseModel):
+    plan_slug: str
+    reason: Optional[str] = "Admin subscription tier adjustment"
+
+
+class AdminPlanUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    monthly_limit: Optional[int] = None
+    rate_limit_rpm: Optional[int] = None
+    price_cents: Optional[int] = None
+    stripe_price_id: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class AdminPlanResponse(BaseModel):
+    id: str
+    name: str
+    slug: str
+    description: Optional[str] = None
+    monthly_limit: int
+    rate_limit_rpm: int
+    price_cents: int
+    stripe_price_id: Optional[str] = None
+    is_active: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class UserStatusUpdateRequest(BaseModel):
@@ -516,7 +574,20 @@ def get_admin_stats(
 
     # Pure database calculations without any hardcoded dummy offsets
     total_earnings = round(sum(c.revenue for c in campaigns), 2)
-    api_revenue = 0.0  # Real revenue from verified payment transactions only
+    ensure_default_plans(db)
+    total_subscriptions = db.query(Subscription).count()
+    free_plan = db.query(Plan).filter(Plan.slug == "free").first()
+    paid_sub_query = db.query(Subscription).filter(
+        Subscription.status == "active",
+        Subscription.plan_id != (free_plan.id if free_plan else "")
+    )
+    paid_subscribers = paid_sub_query.count()
+    api_revenue = 0.0
+    for ps in paid_sub_query.all():
+        p = db.query(Plan).filter(Plan.id == ps.plan_id).first()
+        if p and p.price_cents:
+            api_revenue += p.price_cents / 100.0
+    api_revenue = round(api_revenue, 2)
     total_tool_runs = db.query(ToolRun).count()
 
     now = datetime.now(timezone.utc)
@@ -534,7 +605,7 @@ def get_admin_stats(
                     month=m_label,
                     tools_queries=total_tool_runs,
                     api_queries=active_api_keys,
-                    earnings=total_earnings,
+                    earnings=total_earnings + api_revenue,
                 )
             )
         else:
@@ -562,6 +633,8 @@ def get_admin_stats(
         avg_ctr=avg_ctr,
         total_earnings=total_earnings,
         api_revenue=api_revenue,
+        total_subscriptions=total_subscriptions,
+        paid_subscribers=paid_subscribers,
         ad_target_percentage=68,
         monthly_activity=monthly_activity,
         revenue_breakdown=RevenueBreakdown(),
@@ -1171,12 +1244,7 @@ async def upload_media(
     file_url = None
     cdn_provider = "local"
 
-    has_cloudinary_config = (
-        bool(settings.CLOUDINARY_URL) or
-        (bool(settings.CLOUDINARY_CLOUD_NAME) and (bool(settings.CLOUDINARY_API_KEY) or bool(settings.CLOUDINARY_API_SECRET)))
-    )
-
-    if has_cloudinary_config:
+    if settings.cloudinary_configured:
         try:
             import cloudinary
             import cloudinary.uploader
@@ -1185,8 +1253,8 @@ async def upload_media(
             else:
                 cloudinary.config(
                     cloud_name=settings.CLOUDINARY_CLOUD_NAME,
-                    api_key=settings.CLOUDINARY_API_KEY or "8dAmqCJlXSD3j90IZYGgOCZcJRI",
-                    api_secret=settings.CLOUDINARY_API_SECRET or "8dAmqCJlXSD3j90IZYGgOCZcJRI",
+                    api_key=settings.CLOUDINARY_API_KEY,
+                    api_secret=settings.CLOUDINARY_API_SECRET,
                     secure=True,
                 )
             c_res = cloudinary.uploader.upload(
@@ -1347,34 +1415,12 @@ def get_admin_audit_logs(
 # ============================================================================
 
 
-def seed_default_api_keys(db: Session, admin_id: str):
-    if db.query(ApiKey).count() == 0 and admin_id:
-        random_hex = secrets.token_hex(24)
-        raw_key = f"lon_live_{random_hex}"
-        key_prefix = f"lon_live_{random_hex[:8]}"
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        default_key = ApiKey(
-            id=str(uuid.uuid4()),
-            user_id=admin_id,
-            name="Default Platform Key",
-            key_prefix=key_prefix,
-            key_hash=key_hash,
-            tier="developer",
-            monthly_limit=10000,
-            current_month_usage=142,
-            is_active=True,
-            created_at=datetime.now(timezone.utc),
-            last_used_at=datetime.now(timezone.utc),
-        )
-        db.add(default_key)
-        db.commit()
 
 @router.get("/api-keys", response_model=List[ApiKeyResponse], summary="List All Developer API Keys")
 def list_api_keys(
     admin_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    # No automatic phantom key re-seeding
     keys = db.query(ApiKey).order_by(ApiKey.created_at.desc()).all()
     results = []
     for k in keys:
@@ -1388,7 +1434,7 @@ def list_api_keys(
                 name=k.name,
                 key_prefix=k.key_prefix,
                 masked_key=f"{k.key_prefix}••••••••••••",
-                key_value=k.key_value,
+                # key_value intentionally omitted — raw keys are never stored or returned
                 tier=k.tier,
                 monthly_limit=k.monthly_limit,
                 current_month_usage=k.current_month_usage,
@@ -1423,7 +1469,7 @@ def create_api_key(
         name=payload.name.strip(),
         key_prefix=key_prefix,
         key_hash=key_hash,
-        key_value=raw_key,
+        # key_value intentionally NOT stored — raw key shown once at creation only
         tier=payload.tier.lower(),
         monthly_limit=payload.monthly_limit,
         current_month_usage=0,
@@ -1457,14 +1503,14 @@ def create_api_key(
         name=new_key.name,
         key_prefix=new_key.key_prefix,
         masked_key=f"{new_key.key_prefix}••••••••••••",
-        key_value=new_key.key_value,
+        # key_value NOT included — use secret_key below (shown once only)
         tier=new_key.tier,
         monthly_limit=new_key.monthly_limit,
         current_month_usage=new_key.current_month_usage,
         is_active=new_key.is_active,
         created_at=new_key.created_at,
         last_used_at=new_key.last_used_at,
-        secret_key=raw_key,
+        secret_key=raw_key,  # One-time display — not persisted in DB
     )
 
 
@@ -1561,3 +1607,181 @@ def delete_api_key(
     db.add(audit)
     db.commit()
     return {"status": "ok", "message": f"API key '{key_name}' permanently removed."}
+
+
+# ============================================================================
+# SUBSCRIPTION & PLAN MANAGEMENT (ADMIN)
+# ============================================================================
+
+@router.get("/subscriptions", response_model=List[AdminSubscriptionItem], summary="List all developer subscriptions")
+def list_subscriptions(
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Returns all developer subscriptions with user and plan details."""
+    ensure_default_plans(db)
+    subs = db.query(Subscription).order_by(Subscription.created_at.desc()).all()
+    results = []
+    for s in subs:
+        user = db.query(User).filter(User.id == s.user_id).first()
+        plan = db.query(Plan).filter(Plan.id == s.plan_id).first()
+        results.append(
+            AdminSubscriptionItem(
+                id=s.id,
+                user_id=s.user_id,
+                user_email=user.email if user else None,
+                user_name=user.name if user else None,
+                user_avatar=user.avatar if user else None,
+                plan_id=s.plan_id,
+                plan_name=plan.name if plan else "Unknown",
+                plan_slug=plan.slug if plan else "free",
+                monthly_limit=plan.monthly_limit if plan else 1000,
+                rate_limit_rpm=plan.rate_limit_rpm if plan else 60,
+                price_cents=plan.price_cents if plan else 0,
+                stripe_customer_id=s.stripe_customer_id,
+                stripe_subscription_id=s.stripe_subscription_id,
+                status=s.status,
+                current_period_start=s.current_period_start,
+                current_period_end=s.current_period_end,
+                created_at=s.created_at,
+                updated_at=s.updated_at,
+            )
+        )
+    return results
+
+
+@router.patch("/subscriptions/{user_id}", response_model=AdminSubscriptionItem, summary="Update user subscription tier")
+def update_user_subscription(
+    user_id: str,
+    payload: AdminSubscriptionUpdate,
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin override to change a user's subscription tier and sync API key quotas."""
+    ensure_default_plans(db)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target_plan = db.query(Plan).filter(Plan.slug == payload.plan_slug).first()
+    if not target_plan:
+        raise HTTPException(status_code=400, detail=f"Plan '{payload.plan_slug}' does not exist")
+
+    sub = db.query(Subscription).filter(Subscription.user_id == user_id).first()
+    old_plan_slug = "none"
+    if not sub:
+        sub = Subscription(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            plan_id=target_plan.id,
+            status="active",
+        )
+        db.add(sub)
+    else:
+        old_plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
+        old_plan_slug = old_plan.slug if old_plan else "unknown"
+        sub.plan_id = target_plan.id
+        sub.status = "active"
+
+    # Automatically sync user's active API keys to the new plan quota!
+    db.query(ApiKey).filter(ApiKey.user_id == user_id, ApiKey.is_active == True).update(
+        {"monthly_limit": target_plan.monthly_limit, "tier": target_plan.slug},
+        synchronize_session=False,
+    )
+
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        id=str(uuid.uuid4()),
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="USER_PLAN_OVERRIDE",
+        resource_type="subscription",
+        resource_id=user_id,
+        details=f"Changed user '{user.email}' tier from '{old_plan_slug}' to '{target_plan.slug}'. Reason: {payload.reason or 'Admin override'}",
+        ip_address=ip,
+        user_agent=ua,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(sub)
+
+    return AdminSubscriptionItem(
+        id=sub.id,
+        user_id=sub.user_id,
+        user_email=user.email,
+        user_name=user.name,
+        user_avatar=user.avatar,
+        plan_id=sub.plan_id,
+        plan_name=target_plan.name,
+        plan_slug=target_plan.slug,
+        monthly_limit=target_plan.monthly_limit,
+        rate_limit_rpm=target_plan.rate_limit_rpm,
+        price_cents=target_plan.price_cents,
+        stripe_customer_id=sub.stripe_customer_id,
+        stripe_subscription_id=sub.stripe_subscription_id,
+        status=sub.status,
+        current_period_start=sub.current_period_start,
+        current_period_end=sub.current_period_end,
+        created_at=sub.created_at,
+        updated_at=sub.updated_at,
+    )
+
+
+@router.get("/plans", response_model=List[AdminPlanResponse], summary="List all plans (Admin)")
+def list_admin_plans(
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Returns all plans with configuration."""
+    ensure_default_plans(db)
+    return db.query(Plan).order_by(Plan.price_cents.asc()).all()
+
+
+@router.patch("/plans/{plan_id}", response_model=AdminPlanResponse, summary="Update plan configuration")
+def update_admin_plan(
+    plan_id: str,
+    payload: AdminPlanUpdate,
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Updates a plan's name, description, quota, or rate limit."""
+    plan = db.query(Plan).filter(Plan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    if payload.name is not None:
+        plan.name = payload.name
+    if payload.description is not None:
+        plan.description = payload.description
+    if payload.monthly_limit is not None:
+        plan.monthly_limit = payload.monthly_limit
+    if payload.rate_limit_rpm is not None:
+        plan.rate_limit_rpm = payload.rate_limit_rpm
+    if payload.price_cents is not None:
+        plan.price_cents = payload.price_cents
+    if payload.stripe_price_id is not None:
+        plan.stripe_price_id = payload.stripe_price_id
+    if payload.is_active is not None:
+        plan.is_active = payload.is_active
+
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        id=str(uuid.uuid4()),
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="PLAN_UPDATED",
+        resource_type="plan",
+        resource_id=plan.id,
+        details=f"Updated plan '{plan.name}' ({plan.slug})",
+        ip_address=ip,
+        user_agent=ua,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(plan)
+    return plan
+

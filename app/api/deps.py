@@ -10,17 +10,22 @@ security_scheme = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
     db: Session = Depends(get_db),
 ) -> User:
-    if not credentials:
+    token: Optional[str] = None
+    if credentials:
+        token = credentials.credentials
+    elif "access_token" in request.cookies:
+        token = request.cookies.get("access_token")
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated. Missing Bearer token.",
+            detail="Not authenticated. Missing Bearer token or session cookie.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    token = credentials.credentials
     payload = decode_access_token(token)
     if not payload:
         raise HTTPException(

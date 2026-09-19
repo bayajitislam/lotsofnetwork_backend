@@ -8,8 +8,10 @@ import secrets
 import json
 import base64
 import time
+import collections
+import threading
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 import httpx
@@ -21,6 +23,7 @@ from fastapi import Depends
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.api_key import ApiKey
+from app.config import settings
 
 def create_safe_dns_resolver() -> dns.resolver.Resolver:
     try:
@@ -30,22 +33,153 @@ def create_safe_dns_resolver() -> dns.resolver.Resolver:
         res.nameservers = ["1.1.1.1", "8.8.8.8"]
         return res
 
+# ============================================================================
+# SSRF PROTECTION — Validate that a hostname/IP is a public, routable address.
+# Used by all tools that make outbound network connections.
+# ============================================================================
+
+# Private / reserved address networks (RFC1918, RFC5737, RFC3927, loopback, etc.)
+_FORBIDDEN_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),         # "This" network
+    ipaddress.ip_network("10.0.0.0/8"),         # RFC1918 private
+    ipaddress.ip_network("100.64.0.0/10"),      # CGNAT (RFC6598)
+    ipaddress.ip_network("127.0.0.0/8"),        # Loopback
+    ipaddress.ip_network("169.254.0.0/16"),     # Link-local / cloud metadata (AWS IMDSv1)
+    ipaddress.ip_network("172.16.0.0/12"),      # RFC1918 private
+    ipaddress.ip_network("192.0.0.0/24"),       # IETF protocol assignments
+    ipaddress.ip_network("192.0.2.0/24"),       # TEST-NET-1 (RFC5737)
+    ipaddress.ip_network("192.168.0.0/16"),     # RFC1918 private
+    ipaddress.ip_network("198.18.0.0/15"),      # Benchmarking (RFC2544)
+    ipaddress.ip_network("198.51.100.0/24"),    # TEST-NET-2 (RFC5737)
+    ipaddress.ip_network("203.0.113.0/24"),     # TEST-NET-3 (RFC5737)
+    ipaddress.ip_network("224.0.0.0/4"),        # Multicast
+    ipaddress.ip_network("240.0.0.0/4"),        # Reserved
+    ipaddress.ip_network("255.255.255.255/32"), # Broadcast
+    # IPv6
+    ipaddress.ip_network("::/128"),             # Unspecified
+    ipaddress.ip_network("::1/128"),            # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),           # IPv6 unique local (ULA)
+    ipaddress.ip_network("fe80::/10"),          # IPv6 link-local
+]
+
+
+def validate_external_target(host: str) -> str:
+    """
+    Resolve `host` to an IP and verify it is a publicly routable address.
+    Returns the resolved IP string on success.
+    Raises HTTP 400 if the host resolves to a private/reserved address.
+    """
+    try:
+        resolved = socket.gethostbyname(host)
+    except socket.gaierror:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not resolve hostname: {host}",
+        )
+
+    try:
+        ip_obj = ipaddress.ip_address(resolved)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid resolved IP address: {resolved}",
+        )
+
+    for network in _FORBIDDEN_NETWORKS:
+        if ip_obj in network:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Target '{host}' resolves to a private/reserved address "
+                    f"({resolved}) and cannot be used with this tool."
+                ),
+            )
+
+    return resolved
+
+
+# ============================================================================
+# ANONYMOUS RATE LIMITER — In-memory token bucket per client IP.
+# No Redis needed at current scale. Protects all tools from web abuse.
+# ============================================================================
+
+# Structure: { ip: deque of request timestamps }
+_anon_rate_store: Dict[str, collections.deque] = {}
+_rate_store_lock = threading.Lock()
+
+
+def _check_anon_rate_limit(client_ip: str) -> None:
+    """Enforce ANON_RATE_LIMIT_PER_MINUTE requests per minute per IP."""
+    limit = settings.ANON_RATE_LIMIT_PER_MINUTE
+    now = time.monotonic()
+    window = 60.0  # 1 minute sliding window
+
+    with _rate_store_lock:
+        if client_ip not in _anon_rate_store:
+            _anon_rate_store[client_ip] = collections.deque()
+
+        dq = _anon_rate_store[client_ip]
+        # Evict timestamps outside the window
+        while dq and now - dq[0] > window:
+            dq.popleft()
+
+        if len(dq) >= limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Rate limit exceeded. Free web tool access is limited to "
+                    f"{limit} requests per minute. For higher limits, use a developer API key."
+                ),
+                headers={"Retry-After": "60"},
+            )
+
+        dq.append(now)
+
+
+# ============================================================================
+# API KEY AUTHENTICATION & QUOTA METERING
+# ============================================================================
+
+def _maybe_reset_monthly_quota(key_obj: ApiKey, db: Session) -> None:
+    """Reset current_month_usage to 0 if we are in a new calendar month."""
+    now = datetime.now(timezone.utc)
+    reset_at = key_obj.quota_reset_at
+    # Ensure reset_at is timezone-aware for comparison
+    if reset_at.tzinfo is None:
+        from datetime import timezone as _tz
+        reset_at = reset_at.replace(tzinfo=_tz.utc)
+
+    if (now.year, now.month) > (reset_at.year, reset_at.month):
+        key_obj.current_month_usage = 0
+        key_obj.quota_reset_at = now
+
+
 def verify_and_meter_api_key(request: Request, db: Session = Depends(get_db)) -> Optional[ApiKey]:
+    """
+    Extracts and validates the developer API key from the request.
+
+    - API key present + valid  → metered, returns ApiKey object
+    - API key present + invalid → HTTP 401
+    - API key present + revoked → HTTP 403
+    - API key present + over quota → HTTP 429
+    - No API key               → anonymous web access; enforce IP rate limit
+    """
+    # Accept key only from headers (not query params — they appear in logs)
     api_key_str = request.headers.get("X-API-Key")
     if not api_key_str:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer lon_live_"):
-            api_key_str = auth_header.replace("Bearer ", "").strip()
-    if not api_key_str:
-        api_key_str = request.query_params.get("api_key")
+            api_key_str = auth_header.replace("Bearer ", "", 1).strip()
 
     if not api_key_str:
+        # Anonymous web user — enforce IP-based rate limit
+        client_ip = request.client.host if request.client else "unknown"
+        _check_anon_rate_limit(client_ip)
         return None
 
+    # Authenticated API key path — lookup by SHA-256 hash ONLY (no raw key in DB)
     key_hash = hashlib.sha256(api_key_str.encode()).hexdigest()
-    key_obj = db.query(ApiKey).filter(
-        (ApiKey.key_hash == key_hash) | (ApiKey.key_value == api_key_str)
-    ).first()
+    key_obj = db.query(ApiKey).filter(ApiKey.key_hash == key_hash).first()
 
     if not key_obj:
         raise HTTPException(
@@ -59,16 +193,25 @@ def verify_and_meter_api_key(request: Request, db: Session = Depends(get_db)) ->
             detail="API Key has been revoked or suspended by platform administrator.",
         )
 
+    # Reset quota if we've crossed into a new calendar month
+    _maybe_reset_monthly_quota(key_obj, db)
+
     if key_obj.current_month_usage >= key_obj.monthly_limit:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Monthly API rate limit exceeded ({key_obj.monthly_limit} requests/month). Please contact admin to upgrade quota.",
+            detail=(
+                f"Monthly API quota exceeded ({key_obj.monthly_limit:,} requests/month). "
+                f"Upgrade your plan or contact support."
+            ),
+            headers={"X-Quota-Limit": str(key_obj.monthly_limit)},
         )
 
+    # Atomic increment + timestamp
     key_obj.current_month_usage += 1
     key_obj.last_used_at = datetime.now(timezone.utc)
     db.commit()
     return key_obj
+
 
 router = APIRouter(prefix="/tools", tags=["Networking Tools Engine"], dependencies=[Depends(verify_and_meter_api_key)])
 
@@ -119,26 +262,214 @@ def record_tool_execution(
 
 
 ALL_TOOLS_METADATA = [
-    {"name": "IP Geolocation Lookup", "slug": "ip-lookup", "category": "IP & Routing"},
-    {"name": "Visual Subnet Calculator", "slug": "subnet-calculator", "category": "IP & Routing"},
-    {"name": "CIDR & Subnet Converter", "slug": "cidr-converter", "category": "IP & Routing"},
-    {"name": "IPv6 Prefix & Range Calculator", "slug": "ipv6-calculator", "category": "IP & Routing"},
-    {"name": "DNS Propagation Lookup", "slug": "dns-lookup", "category": "DNS & Domain"},
-    {"name": "Domain WHOIS & RDAP Lookup", "slug": "whois-lookup", "category": "DNS & Domain"},
-    {"name": "Reverse DNS (PTR) Lookup", "slug": "reverse-dns", "category": "DNS & Domain"},
-    {"name": "IDN Punycode Converter", "slug": "punycode-converter", "category": "DNS & Domain"},
-    {"name": "TCP Port Scanner", "slug": "port-checker", "category": "Security & Ports"},
-    {"name": "SSL / TLS Certificate Inspector", "slug": "ssl-checker", "category": "Security & Ports"},
-    {"name": "HTTP Security Headers Analyzer", "slug": "http-headers", "category": "Web & SSL"},
-    {"name": "MAC Address Vendor / OUI Lookup", "slug": "mac-lookup", "category": "Utilities"},
-    {"name": "User-Agent Header Analyzer", "slug": "user-agent-analyzer", "category": "Utilities"},
-    {"name": "UUID v4 / v7 Generator", "slug": "uuid-generator", "category": "Utilities"},
-    {"name": "JSON Formatter & Validator", "slug": "json-formatter", "category": "Utilities"},
-    {"name": "Chmod Unix Permissions Calculator", "slug": "chmod-calculator", "category": "Utilities"},
-    {"name": "Unix Epoch & Timestamp Converter", "slug": "timestamp-converter", "category": "Utilities"},
-    {"name": "Base64 Encoder & Decoder", "slug": "base64-encode-decode", "category": "Utilities"},
+    {
+        "id": "ip-lookup",
+        "name": "IP Geolocation Lookup",
+        "slug": "ip-lookup",
+        "category": "IP & Routing",
+        "description": "Discover detailed geographic location, ISP, ASN, timezone, and coordinates for any IPv4 or IPv6 address.",
+        "icon": "Globe",
+        "endpoint": "/api/v1/tools/ip-lookup",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "subnet-calculator",
+        "name": "Visual Subnet Calculator",
+        "slug": "subnet-calculator",
+        "category": "IP & Routing",
+        "description": "Calculate usable IP ranges, network address, broadcast address, wildcard mask, and CIDR notation.",
+        "icon": "Calculator",
+        "endpoint": "/api/v1/tools/subnet-calculator",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "cidr-converter",
+        "name": "CIDR & Subnet Converter",
+        "slug": "cidr-converter",
+        "category": "IP & Routing",
+        "description": "Convert between CIDR prefix notation, standard dotted-decimal subnet masks, and IP ranges.",
+        "icon": "Layers",
+        "endpoint": "/api/v1/tools/cidr-converter",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "ipv6-calculator",
+        "name": "IPv6 Prefix & Range Calculator",
+        "slug": "ipv6-calculator",
+        "category": "IP & Routing",
+        "description": "Expand, compress, and analyze IPv6 addresses, network prefixes, subnets, and host capacities.",
+        "icon": "Cpu",
+        "endpoint": "/api/v1/tools/ipv6-calculator",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "dns-lookup",
+        "name": "DNS Propagation Lookup",
+        "slug": "dns-lookup",
+        "category": "DNS & Domain",
+        "description": "Query authoritative name servers for A, AAAA, CNAME, MX, TXT, NS, and SOA records.",
+        "icon": "Search",
+        "endpoint": "/api/v1/tools/dns-lookup",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "whois-lookup",
+        "name": "Domain WHOIS & RDAP Lookup",
+        "slug": "whois-lookup",
+        "category": "DNS & Domain",
+        "description": "Inspect domain registration, registrar info, creation/expiration dates, and RDAP records.",
+        "icon": "FileText",
+        "endpoint": "/api/v1/tools/whois-lookup",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "reverse-dns",
+        "name": "Reverse DNS (PTR) Lookup",
+        "slug": "reverse-dns",
+        "category": "DNS & Domain",
+        "description": "Resolve an IPv4 or IPv6 address back to its associated PTR domain name.",
+        "icon": "Compass",
+        "endpoint": "/api/v1/tools/reverse-dns",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "punycode-converter",
+        "name": "IDN Punycode Converter",
+        "slug": "punycode-converter",
+        "category": "DNS & Domain",
+        "description": "Encode and decode Internationalized Domain Names (IDN) with Unicode characters to ASCII Punycode.",
+        "icon": "Globe2",
+        "endpoint": "/api/v1/tools/punycode-converter",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "port-checker",
+        "name": "TCP Port Scanner",
+        "slug": "port-checker",
+        "category": "Security & Ports",
+        "description": "Test connectivity and firewall status for common web, database, SSH, and mail ports.",
+        "icon": "ShieldAlert",
+        "endpoint": "/api/v1/tools/port-checker",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "ssl-checker",
+        "name": "SSL / TLS Certificate Inspector",
+        "slug": "ssl-checker",
+        "category": "Security & Ports",
+        "description": "Verify SSL certificate validity, issuer, SAN domains, expiration countdown, and cipher suites.",
+        "icon": "Lock",
+        "endpoint": "/api/v1/tools/ssl-checker",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "http-headers",
+        "name": "HTTP Security Headers Analyzer",
+        "slug": "http-headers",
+        "category": "Security & Ports",
+        "description": "Audit response headers for HSTS, CSP, X-Frame-Options, permissions policy, and server tokens.",
+        "icon": "ShieldCheck",
+        "endpoint": "/api/v1/tools/http-headers",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "mac-lookup",
+        "name": "MAC Address Vendor / OUI Lookup",
+        "slug": "mac-lookup",
+        "category": "Utilities",
+        "description": "Identify hardware vendor and IEEE OUI manufacturer block from any network MAC address.",
+        "icon": "HardDrive",
+        "endpoint": "/api/v1/tools/mac-lookup",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "user-agent-analyzer",
+        "name": "User-Agent Header Analyzer",
+        "slug": "user-agent-analyzer",
+        "category": "Utilities",
+        "description": "Parse browser family, operating system, rendering engine, and device form factor from User-Agent.",
+        "icon": "Smartphone",
+        "endpoint": "/api/v1/tools/user-agent-analyzer",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "uuid-generator",
+        "name": "UUID v4 / v7 Generator",
+        "slug": "uuid-generator",
+        "category": "Utilities",
+        "description": "Generate cryptographically secure random UUID v4 and time-sortable UUID v7 identifiers in bulk.",
+        "icon": "Key",
+        "endpoint": "/api/v1/tools/uuid-generator",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "json-formatter",
+        "name": "JSON Formatter & Validator",
+        "slug": "json-formatter",
+        "category": "Utilities",
+        "description": "Prettify, minify, and validate complex JSON payloads with instant error location detection.",
+        "icon": "FileCode",
+        "endpoint": "/api/v1/tools/json-formatter",
+        "method": "GET",
+        "is_popular": True,
+    },
+    {
+        "id": "chmod-calculator",
+        "name": "Chmod Unix Permissions Calculator",
+        "slug": "chmod-calculator",
+        "category": "Utilities",
+        "description": "Interactive visual generator for Linux octal (755, 644) and symbolic (rwxr-xr-x) file permissions.",
+        "icon": "Terminal",
+        "endpoint": "/api/v1/tools/chmod-calculator",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "timestamp-converter",
+        "name": "Unix Epoch & Timestamp Converter",
+        "slug": "timestamp-converter",
+        "category": "Utilities",
+        "description": "Convert Unix epoch timestamps (seconds, milliseconds) to human-readable UTC and local date formats.",
+        "icon": "Clock",
+        "endpoint": "/api/v1/tools/timestamp-converter",
+        "method": "GET",
+        "is_popular": False,
+    },
+    {
+        "id": "base64-encode-decode",
+        "name": "Base64 Encoder & Decoder",
+        "slug": "base64-encode-decode",
+        "category": "Utilities",
+        "description": "Safely encode and decode UTF-8 text, ASCII strings, and URLs using standard Base64 encoding.",
+        "icon": "Code",
+        "endpoint": "/api/v1/tools/base64-encode-decode",
+        "method": "GET",
+        "is_popular": False,
+    },
 ]
 ALL_22_TOOLS_METADATA = ALL_TOOLS_METADATA
+
+
+@router.get("", summary="Get all available tools in catalog")
+@router.get("/", summary="Get all available tools in catalog")
+async def list_all_tools():
+    """Returns the complete list of available network and developer tools."""
+    return {"tools": ALL_TOOLS_METADATA, "total": len(ALL_TOOLS_METADATA)}
+
 
 
 class ToolPingResponse(BaseModel):
@@ -674,24 +1005,8 @@ async def check_ports(payload: PortCheckRequest):
         raw_host = raw_host[8:]
     host = raw_host.split("/")[0].split(":")[0]
 
-    try:
-        resolved_ip = await asyncio.to_thread(socket.gethostbyname, host)
-    except Exception:
-        resolved_ip = None
-
-    if not resolved_ip:
-        record_tool_execution(
-            tool_slug="port-checker",
-            tool_name="TCP Port Scanner",
-            category="Security & Ports",
-            latency_ms=1.0,
-            status="error",
-            error_message=f"Could not resolve hostname: {host}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Could not resolve hostname: {host}",
-        )
+    # SSRF protection: reject private/internal IP ranges
+    resolved_ip = await asyncio.to_thread(validate_external_target, host)
 
     ports = payload.ports or [21, 22, 25, 53, 80, 110, 143, 443, 3306, 5432, 8080]
     ports = [p for p in ports if 1 <= p <= 65535][:25]
@@ -989,6 +1304,9 @@ async def ssl_checker(payload: SslCheckRequest, request: Request):
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Hostname cannot be empty")
 
+    # SSRF protection: reject private/internal IP ranges
+    await asyncio.to_thread(validate_external_target, clean_host)
+
     issuer_dict = {}
     subject_dict = {}
     valid_from = None
@@ -1100,12 +1418,18 @@ async def http_headers_analyzer(payload: HttpHeadersRequest, request: Request):
     if not url.startswith("http://") and not url.startswith("https://"):
         url = f"https://{url}"
 
+    # SSRF protection: extract hostname and validate it is publicly routable
+    from urllib.parse import urlparse
+    parsed_host = urlparse(url).hostname or ""
+    if parsed_host:
+        await asyncio.to_thread(validate_external_target, parsed_host)
+
     headers_dict = {}
     status_code = 200
     http_version = "HTTP/1.1"
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=4.5, follow_redirects=True) as client:
+        async with httpx.AsyncClient(verify=True, timeout=4.5, follow_redirects=True) as client:
             try:
                 res = await client.head(url)
                 if res.status_code in [405, 501]:

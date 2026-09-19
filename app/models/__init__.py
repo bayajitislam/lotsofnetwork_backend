@@ -7,6 +7,8 @@ from app.models.tag import Tag
 from app.models.article import Article
 from app.models.tool_run import ToolRun
 from app.models.crash_log import CrashLog
+from app.models.plan import Plan
+from app.models.subscription import Subscription
 
 __all__ = [
     "User",
@@ -18,4 +20,6 @@ __all__ = [
     "Article",
     "ToolRun",
     "CrashLog",
+    "Plan",
+    "Subscription",
 ]

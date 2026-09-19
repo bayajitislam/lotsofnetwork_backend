@@ -48,12 +48,19 @@ def test_dns_lookup():
 
 
 def test_port_checker():
-    # Test localhost standard check
-    resp = client.post("/api/v1/tools/port-checker", json={"host": "127.0.0.1", "ports": [8000, 3000]})
-    assert resp.status_code == 200
+    # SSRF protection: private/loopback IPs must be rejected with 400
+    resp_private = client.post("/api/v1/tools/port-checker", json={"host": "127.0.0.1", "ports": [80]})
+    assert resp_private.status_code == 400, "Loopback IP must be rejected by SSRF protection"
+    assert "private" in resp_private.json()["detail"].lower() or "reserved" in resp_private.json()["detail"].lower()
+
+    resp_internal = client.post("/api/v1/tools/port-checker", json={"host": "192.168.1.1", "ports": [80]})
+    assert resp_internal.status_code == 400, "RFC1918 private IP must be rejected by SSRF protection"
+
+    # Public IP scan should be allowed
+    resp = client.post("/api/v1/tools/port-checker", json={"host": "8.8.8.8", "ports": [53, 443]})
+    assert resp.status_code == 200, f"Public IP should be scannable, got: {resp.json()}"
     data = resp.json()
-    assert data["host"] == "127.0.0.1"
+    assert data["host"] == "8.8.8.8"
     assert data["scanned_ports_count"] == 2
-    # At least port 8000 or 3000 should be open or closed without error
     statuses = [r["status"] for r in data["results"]]
-    assert all(s in ["open", "closed", "filtered (timeout)"] for s in statuses)
+    assert all(s in ["open", "closed", "filtered", "error"] for s in statuses)

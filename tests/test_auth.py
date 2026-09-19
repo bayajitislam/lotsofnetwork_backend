@@ -3,19 +3,16 @@ import jwt
 from fastapi.testclient import TestClient
 from app.config import settings
 from app.main import app
-from app.database import Base, engine, SessionLocal
+from app.database import Base, get_engine, SessionLocal
 from app.models.user import User
 from app.models.audit_log import AuditLog
-
-# Configure test environment
-settings.ENV = "test"
 
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=get_engine())
     db = SessionLocal()
     db.query(AuditLog).delete()
     db.query(User).delete()

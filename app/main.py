@@ -6,13 +6,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import settings
-from app.database import Base, engine
-from app.models import user, api_key, audit_log, campaign, article, tool_run, crash_log  # Ensure all models are registered
-from app.api.v1 import auth, admin, tools, articles, ads
+from app.database import Base, get_engine
+from app.models import user, api_key, audit_log, campaign, article, tool_run, crash_log, plan, subscription  # Ensure all models are registered
+from app.api.v1 import auth, admin, tools, articles, ads, billing, developer
 
 # Setup uploads directory for ad banner media & article assets
 UPLOAD_DIR = settings.uploads_dir
@@ -22,19 +21,13 @@ os.makedirs(ADS_UPLOAD_DIR, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Validate required secrets before accepting traffic (production/staging only)
+    settings.validate_production_secrets()
+
     # Initialize / update database tables
-    Base.metadata.create_all(bind=engine)
-    try:
-        with engine.connect() as conn:
-            cursor = conn.execute(text("PRAGMA table_info(campaigns)"))
-            cols = [row[1] for row in cursor.fetchall()]
-            if "image_url" not in cols:
-                conn.execute(text("ALTER TABLE campaigns ADD COLUMN image_url VARCHAR(1000)"))
-            if "image_dimensions" not in cols:
-                conn.execute(text("ALTER TABLE campaigns ADD COLUMN image_dimensions VARCHAR(50) DEFAULT '728x90'"))
-            conn.commit()
-    except Exception as e:
-        print(f"[Migration Warning] campaigns column check: {e}")
+    # NOTE: This will be replaced by `alembic upgrade head` in FIX-03.
+    #       For now, create_all is safe for SQLite dev and initial Supabase setup.
+    Base.metadata.create_all(bind=get_engine())
     yield
 
 
@@ -77,6 +70,8 @@ app.include_router(tools.router, prefix=settings.API_V1_STR)
 app.include_router(articles.router, prefix=settings.API_V1_STR)
 app.include_router(articles.legacy_router, prefix=settings.API_V1_STR)
 app.include_router(ads.router, prefix=settings.API_V1_STR)
+app.include_router(billing.router, prefix=settings.API_V1_STR)
+app.include_router(developer.router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Health"])

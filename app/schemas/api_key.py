@@ -11,7 +11,8 @@ class ApiKeyResponse(BaseModel):
     name: str
     key_prefix: str
     masked_key: str
-    key_value: Optional[str] = None
+    # key_value intentionally removed — raw keys are NEVER stored in the database.
+    # The key is shown exactly once at creation time via ApiKeyCreateResponse.secret_key.
     tier: str
     monthly_limit: int
     current_month_usage: int
@@ -30,7 +31,7 @@ class ApiKeyCreateRequest(BaseModel):
 
 
 class ApiKeyCreateResponse(ApiKeyResponse):
-    secret_key: str  # Raw unhashed secret key
+    secret_key: str  # Raw unhashed secret key — shown ONCE, never stored in DB
 
 
 class ApiKeyUpdateRequest(BaseModel):

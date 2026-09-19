@@ -7,7 +7,7 @@ from app.database import SessionLocal
 from app.models.api_key import ApiKey
 from app.models.audit_log import AuditLog
 
-settings.ENV = "test"
+settings.ENV = "test"  # Handled by conftest.py — left here for clarity
 client = TestClient(app)
 
 
@@ -26,6 +26,7 @@ def get_test_admin_token():
 
 def test_list_and_create_api_key():
     token = get_test_admin_token()
+    stats_before = client.get("/api/v1/admin/stats", headers={"Authorization": f"Bearer {token}"}).json()["api_revenue"]
 
     # 1. Create API key
     payload = {
@@ -44,25 +45,27 @@ def test_list_and_create_api_key():
     assert data["secret_key"].startswith("lon_live_")
     assert len(data["secret_key"]) > 20
     assert data["is_active"] is True
-    assert data["key_value"] == data["secret_key"]
+    # key_value must NOT be in the response — raw keys are never returned from list endpoints
+    assert "key_value" not in data or data.get("key_value") is None
 
     key_id = data["id"]
     secret_key = data["secret_key"]
 
-    # 2. List API keys
+    # 2. List API keys — secret_key must NOT be exposed
     list_res = client.get("/api/v1/admin/api-keys", headers={"Authorization": f"Bearer {token}"})
     assert list_res.status_code == 200
     keys = list_res.json()
     assert any(k["id"] == key_id for k in keys)
 
-    # Key value is available for admin management
+    # Verify raw key is NOT returned in the list endpoint (security check)
     target = next(k for k in keys if k["id"] == key_id)
-    assert target["key_value"] == secret_key
+    assert target.get("key_value") is None, "Raw key must never be returned from the list endpoint"
+    assert target.get("secret_key") is None, "secret_key must never appear in list responses"
 
-    # 3. Check stats revenue is NOT artificially multiplied by $29
+    # 3. Check stats revenue is NOT artificially multiplied by API key creation
     stats_res = client.get("/api/v1/admin/stats", headers={"Authorization": f"Bearer {token}"})
     assert stats_res.status_code == 200
-    assert stats_res.json()["api_revenue"] == 0.0  # Zero fake money!
+    assert stats_res.json()["api_revenue"] == stats_before  # Key creation must not add fake key-based revenue
 
     # 4. Test live tool authentication with the key
     # A. Valid key
@@ -79,6 +82,8 @@ def test_list_and_create_api_key():
     saved_key = db.query(ApiKey).filter(ApiKey.id == key_id).first()
     assert saved_key.current_month_usage == 1
     assert saved_key.last_used_at is not None
+    # Verify raw key is NOT stored in DB
+    assert not hasattr(saved_key, "key_value") or saved_key.key_value is None  # type: ignore[attr-defined]
     db.close()
 
     # B. Invalid key
