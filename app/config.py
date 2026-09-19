@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 120  # 120-minute (2 hours) access token
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30    # 30-day persistent sliding session
     
+    # Cloudinary CDN Configuration
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = "8dAmqCJlXSD3j90IZYGgOCZcJRI"
+    CLOUDINARY_URL: str = ""
+
     # Google OAuth 2.0 Web Client ID
     GOOGLE_CLIENT_ID: str = ""
 
@@ -41,6 +47,11 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def uploads_dir(self) -> str:
+        from pathlib import Path
+        return str(Path(__file__).resolve().parent.parent / "uploads")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

@@ -117,3 +117,66 @@ def test_crash_log_resolution_and_retrieval():
     )
     assert patch_res.status_code == 200
     assert patch_res.json()["resolved"] is True
+
+
+import io
+
+
+def test_ad_campaign_creative_upload_and_dimensions():
+    admin_token = get_test_admin_token()
+
+    # 1. Test media upload endpoint
+    sample_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    upload_res = client.post(
+        "/api/v1/admin/media/upload",
+        files={"file": ("test_banner.png", io.BytesIO(sample_png), "image/png")},
+        headers={"Authorization": f"Bearer {admin_token}"}
+    )
+    assert upload_res.status_code == 200
+    upload_data = upload_res.json()
+    assert upload_data["status"] == "ok"
+    assert "/uploads/ads/" in upload_data["url"]
+    uploaded_url = upload_data["url"]
+
+    # 2. Create a campaign with image_url and standard dimensions (728x90)
+    create_res = client.post(
+        "/api/v1/admin/campaigns",
+        json={
+            "name": "Cloudflare Radar Banner",
+            "sponsor": "Cloudflare",
+            "target_url": "https://cloudflare.com?ref=lotsofnetwork",
+            "image_url": uploaded_url,
+            "image_dimensions": "728x90",
+            "slot": "tool_header",
+            "target_impressions": 10000,
+        },
+        headers={"Authorization": f"Bearer {admin_token}"}
+    )
+    assert create_res.status_code == 200
+    camp_data = create_res.json()
+    assert camp_data["image_url"] == uploaded_url
+    assert camp_data["image_dimensions"] == "728x90"
+
+    # 3. Check public /api/v1/ads/active delivers image_url and image_dimensions
+    ads_res = client.get("/api/v1/ads/active?slot=tool_header")
+    assert ads_res.status_code == 200
+    active_ads = ads_res.json()
+    target_ad = next(a for a in active_ads if a["id"] == camp_data["id"])
+    assert target_ad["image_url"] == uploaded_url
+    assert target_ad["image_dimensions"] == "728x90"
+
+    # 4. Test updating/editing the campaign
+    patch_res = client.patch(
+        f"/api/v1/admin/campaigns/{camp_data['id']}",
+        json={
+            "name": "Cloudflare Radar Pro Special",
+            "image_dimensions": "300x250",
+            "slot": "sidebar_banner",
+        },
+        headers={"Authorization": f"Bearer {admin_token}"}
+    )
+    assert patch_res.status_code == 200
+    patched_data = patch_res.json()
+    assert patched_data["name"] == "Cloudflare Radar Pro Special"
+    assert patched_data["image_dimensions"] == "300x250"
+    assert patched_data["slot"] == "sidebar_banner"

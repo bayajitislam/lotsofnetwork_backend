@@ -20,6 +20,8 @@ class AdServeResponse(BaseModel):
     name: str
     sponsor: str
     target_url: str
+    image_url: Optional[str] = None
+    image_dimensions: Optional[str] = "728x90"
     slot: str
     impressions: int
     clicks: int
@@ -47,6 +49,8 @@ def get_active_ads(slot: Optional[str] = None, db: Session = Depends(get_db)):
             name=c.name,
             sponsor=c.sponsor,
             target_url=c.target_url,
+            image_url=c.image_url,
+            image_dimensions=c.image_dimensions or "728x90",
             slot=c.slot,
             impressions=c.impressions,
             clicks=c.clicks,

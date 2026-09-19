@@ -5,7 +5,8 @@ import hashlib
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+import os
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, File, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -74,6 +75,8 @@ class CampaignCreate(BaseModel):
     name: str
     sponsor: str
     target_url: str
+    image_url: Optional[str] = None
+    image_dimensions: Optional[str] = "728x90"
     slot: str = "tool_header"
     target_impressions: int = 50000
     payout_type: str = "affiliate_cpa"
@@ -85,6 +88,8 @@ class CampaignUpdate(BaseModel):
     name: Optional[str] = None
     sponsor: Optional[str] = None
     target_url: Optional[str] = None
+    image_url: Optional[str] = None
+    image_dimensions: Optional[str] = None
     slot: Optional[str] = None
     target_impressions: Optional[int] = None
     status: Optional[str] = None
@@ -100,6 +105,8 @@ class CampaignResponse(BaseModel):
     name: str
     sponsor: str
     target_url: str
+    image_url: Optional[str] = None
+    image_dimensions: Optional[str] = "728x90"
     slot: str
     impressions: int
     clicks: int
@@ -336,6 +343,8 @@ def seed_default_campaigns(db: Session):
                 sponsor="Hostinger",
                 target_url="https://hostinger.com?ref=lotsofnetwork",
                 slot="tool_header",
+                image_url="https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=728&h=90&q=80",
+                image_dimensions="728x90",
                 impressions=0,
                 clicks=0,
                 target_impressions=25000,
@@ -346,6 +355,8 @@ def seed_default_campaigns(db: Session):
                 sponsor="DigitalOcean",
                 target_url="https://digitalocean.com?ref=lotsofnetwork",
                 slot="sidebar_banner",
+                image_url="https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=300&h=250&q=80",
+                image_dimensions="300x250",
                 impressions=0,
                 clicks=0,
                 target_impressions=15000,
@@ -356,6 +367,8 @@ def seed_default_campaigns(db: Session):
                 sponsor="BunnyCDN",
                 target_url="https://bunny.net?ref=lotsofnetwork",
                 slot="footer_sponsor",
+                image_url="https://images.unsplash.com/photo-1544197150-b99a580bb7a8?auto=format&fit=crop&w=728&h=90&q=80",
+                image_dimensions="728x90",
                 impressions=0,
                 clicks=0,
                 target_impressions=10000,
@@ -1030,8 +1043,13 @@ def create_campaign(
         name=payload.name,
         sponsor=payload.sponsor,
         target_url=payload.target_url,
+        image_url=payload.image_url,
+        image_dimensions=payload.image_dimensions or "728x90",
         slot=payload.slot,
         target_impressions=payload.target_impressions,
+        payout_type=payload.payout_type,
+        revenue=payload.revenue,
+        conversions=payload.conversions,
         impressions=0,
         clicks=0,
         status="active",
@@ -1117,6 +1135,105 @@ def delete_campaign(
     db.add(audit)
     db.commit()
     return {"message": "Campaign deleted successfully"}
+
+
+# ============================================================================
+# MEDIA ASSETS & AD CREATIVE UPLOAD
+# ============================================================================
+
+ALLOWED_MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
+MAX_MEDIA_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+@router.post("/media/upload", summary="Upload media asset for ad campaigns or articles")
+async def upload_media(
+    request: Request,
+    file: UploadFile = File(...),
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    file_ext = os.path.splitext(file.filename or "")[1].lower()
+    if file_ext not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{file_ext}'. Allowed formats: {', '.join(sorted(ALLOWED_MEDIA_EXTENSIONS))}",
+        )
+
+    content = await file.read()
+    if len(content) > MAX_MEDIA_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File size exceeds maximum allowed limit of 5MB")
+
+    token = secrets.token_hex(6)
+    clean_base = re.sub(r'[^a-zA-Z0-9_-]', '', os.path.splitext(file.filename or "ad_creative")[0])[:20]
+    safe_name = f"{clean_base}_{token}{file_ext}"
+
+    from app.config import settings
+    file_url = None
+    cdn_provider = "local"
+
+    has_cloudinary_config = (
+        bool(settings.CLOUDINARY_URL) or
+        (bool(settings.CLOUDINARY_CLOUD_NAME) and (bool(settings.CLOUDINARY_API_KEY) or bool(settings.CLOUDINARY_API_SECRET)))
+    )
+
+    if has_cloudinary_config:
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            if settings.CLOUDINARY_URL:
+                cloudinary.config(cloudinary_url=settings.CLOUDINARY_URL)
+            else:
+                cloudinary.config(
+                    cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+                    api_key=settings.CLOUDINARY_API_KEY or "8dAmqCJlXSD3j90IZYGgOCZcJRI",
+                    api_secret=settings.CLOUDINARY_API_SECRET or "8dAmqCJlXSD3j90IZYGgOCZcJRI",
+                    secure=True,
+                )
+            c_res = cloudinary.uploader.upload(
+                content,
+                folder="lotsofnetwork/ads",
+                public_id=f"{clean_base}_{token}",
+                resource_type="image",
+            )
+            file_url = c_res.get("secure_url") or c_res.get("url")
+            cdn_provider = "cloudinary"
+        except Exception as c_err:
+            print(f"[Cloudinary Warning] CDN upload failed, using local: {c_err}")
+
+    # Local storage persistence
+    target_dir = os.path.join(settings.uploads_dir, "ads")
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, safe_name)
+
+    with open(target_path, "wb") as f:
+        f.write(content)
+
+    if not file_url:
+        file_url = f"/uploads/ads/{safe_name}"
+
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="MEDIA_UPLOADED",
+        resource_type="media",
+        resource_id=safe_name,
+        details=json.dumps({"filename": file.filename, "url": file_url, "provider": cdn_provider, "size": len(content)}),
+        ip_address=ip,
+        user_agent=ua,
+    )
+    db.add(audit)
+    db.commit()
+
+    return {
+        "status": "ok",
+        "url": file_url,
+        "provider": cdn_provider,
+        "filename": file.filename,
+        "size": len(content),
+        "content_type": file.content_type,
+    }
+
 
 
 # ============================================================================

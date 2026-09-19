@@ -1,20 +1,40 @@
+import os
 import traceback
 import uuid
-from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 from app.config import settings
 from app.database import Base, engine
 from app.models import user, api_key, audit_log, campaign, article, tool_run, crash_log  # Ensure all models are registered
 from app.api.v1 import auth, admin, tools, articles, ads
+
+# Setup uploads directory for ad banner media & article assets
+UPLOAD_DIR = settings.uploads_dir
+ADS_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "ads")
+os.makedirs(ADS_UPLOAD_DIR, exist_ok=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize / update database tables
     Base.metadata.create_all(bind=engine)
+    try:
+        with engine.connect() as conn:
+            cursor = conn.execute(text("PRAGMA table_info(campaigns)"))
+            cols = [row[1] for row in cursor.fetchall()]
+            if "image_url" not in cols:
+                conn.execute(text("ALTER TABLE campaigns ADD COLUMN image_url VARCHAR(1000)"))
+            if "image_dimensions" not in cols:
+                conn.execute(text("ALTER TABLE campaigns ADD COLUMN image_dimensions VARCHAR(50) DEFAULT '728x90'"))
+            conn.commit()
+    except Exception as e:
+        print(f"[Migration Warning] campaigns column check: {e}")
     yield
 
 
@@ -27,6 +47,9 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# Static media serving for ad banners & uploads
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Security Headers Middleware
 @app.middleware("http")

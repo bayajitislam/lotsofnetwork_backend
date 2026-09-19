@@ -11,6 +11,8 @@ class Campaign(Base):
     name = Column(String(120), nullable=False)
     sponsor = Column(String(80), nullable=False)
     target_url = Column(String(500), nullable=False)
+    image_url = Column(String(1000), nullable=True)  # Ad banner creative URL or local upload path
+    image_dimensions = Column(String(50), nullable=True, default="728x90")  # Standard ad size: 728x90, 300x250, 300x600, etc.
     slot = Column(String(50), nullable=False, default="tool_header")
     impressions = Column(Integer, default=0, nullable=False)
     clicks = Column(Integer, default=0, nullable=False)
