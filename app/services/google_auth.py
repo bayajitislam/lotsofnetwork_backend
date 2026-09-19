@@ -18,8 +18,8 @@ def verify_google_id_token(token_str: str) -> Dict[str, Any]:
     - audience (if GOOGLE_CLIENT_ID is configured)
     - email_verified is True
     """
-    # Test environment hook for pytest automation
-    if settings.ENV == "test":
+    # Test & Development local simulation hook
+    if settings.ENV in ("test", "development") and token_str.startswith("eyJhbGciOiJIUzI1Ni"): 
         try:
             decoded = jwt.decode(token_str, options={"verify_signature": False})
             if not decoded.get("email_verified", True):

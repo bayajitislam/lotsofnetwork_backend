@@ -166,3 +166,27 @@ def test_unverified_email_rejected():
     resp = client.post("/api/v1/auth/google", json={"credential": unverified_token})
     assert resp.status_code == 400
     assert "not verified" in resp.json()["detail"].lower()
+
+
+def test_refresh_token_sliding_window():
+    # 1. Sign in as admin
+    token = generate_mock_google_token("realbayajitislam@gmail.com", "Bayajit Islam", "sub_refresh_test")
+    res = client.post("/api/v1/auth/google", json={"credential": token})
+    assert res.status_code == 200
+    auth_data = res.json()
+    first_access = auth_data["access_token"]
+    first_refresh = auth_data["refresh_token"]
+
+    # 2. Exchange refresh token for fresh access token and renewed sliding refresh token
+    ref_res = client.post("/api/v1/auth/refresh", json={"refresh_token": first_refresh})
+    assert ref_res.status_code == 200
+    ref_data = ref_res.json()
+    assert "access_token" in ref_data
+    assert "refresh_token" in ref_data
+    assert ref_data["access_token"] != ""
+    assert ref_data["refresh_token"] != ""
+
+    # 3. Use new access token to query /me
+    me_res = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {ref_data['access_token']}"})
+    assert me_res.status_code == 200
+    assert me_res.json()["role"] == "admin"

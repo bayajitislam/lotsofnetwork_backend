@@ -19,3 +19,17 @@ __all__ = [
     "AuditLogResponse",
     "TokenPayload",
 ]
+
+from app.schemas.api_key import (
+    ApiKeyResponse,
+    ApiKeyCreateRequest,
+    ApiKeyCreateResponse,
+    ApiKeyUpdateRequest,
+)
+
+__all__ += [
+    "ApiKeyResponse",
+    "ApiKeyCreateRequest",
+    "ApiKeyCreateResponse",
+    "ApiKeyUpdateRequest",
+]

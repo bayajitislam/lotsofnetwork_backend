@@ -1,6 +1,9 @@
 import json
 import re
-from datetime import datetime, timezone
+import secrets
+import hashlib
+import uuid
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,7 +16,11 @@ from app.models.campaign import Campaign
 from app.models.category import Category
 from app.models.tag import Tag
 from app.models.article import Article
+from app.models.tool_run import ToolRun
+from app.models.crash_log import CrashLog
+from app.api.v1.tools import ALL_22_TOOLS_METADATA
 from app.schemas.auth import UserResponse, AuditLogResponse
+from app.schemas.api_key import ApiKeyResponse, ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeyUpdateRequest
 from app.api.deps import require_admin, get_client_info
 
 router = APIRouter(prefix="/admin", tags=["Admin Portal"])
@@ -69,6 +76,9 @@ class CampaignCreate(BaseModel):
     target_url: str
     slot: str = "tool_header"
     target_impressions: int = 50000
+    payout_type: str = "affiliate_cpa"
+    revenue: float = 0.0
+    conversions: int = 0
 
 
 class CampaignUpdate(BaseModel):
@@ -80,6 +90,9 @@ class CampaignUpdate(BaseModel):
     status: Optional[str] = None
     impressions: Optional[int] = None
     clicks: Optional[int] = None
+    conversions: Optional[int] = None
+    revenue: Optional[float] = None
+    payout_type: Optional[str] = None
 
 
 class CampaignResponse(BaseModel):
@@ -90,6 +103,9 @@ class CampaignResponse(BaseModel):
     slot: str
     impressions: int
     clicks: int
+    conversions: int = 0
+    revenue: float = 0.0
+    payout_type: str = "affiliate_cpa"
     target_impressions: int
     status: str
     created_at: datetime
@@ -193,10 +209,14 @@ class ToolTelemetryItem(BaseModel):
     slug: str
     category: str
     status: str
-    latency_ms: int
+    latency_ms: float
     queries_per_hour: int
     uptime_percentage: float
     error_rate: float
+
+
+class CrashResolveUpdate(BaseModel):
+    resolved: bool = True
 
 
 class CrashLogItem(BaseModel):
@@ -207,6 +227,7 @@ class CrashLogItem(BaseModel):
     message: str
     stack_preview: str
     ip_truncated: str
+    resolved: bool = False
 
 
 # ============================================================================
@@ -315,8 +336,8 @@ def seed_default_campaigns(db: Session):
                 sponsor="Hostinger",
                 target_url="https://hostinger.com?ref=lotsofnetwork",
                 slot="tool_header",
-                impressions=18450,
-                clicks=842,
+                impressions=0,
+                clicks=0,
                 target_impressions=25000,
                 status="active",
             ),
@@ -325,8 +346,8 @@ def seed_default_campaigns(db: Session):
                 sponsor="DigitalOcean",
                 target_url="https://digitalocean.com?ref=lotsofnetwork",
                 slot="sidebar_banner",
-                impressions=8920,
-                clicks=318,
+                impressions=0,
+                clicks=0,
                 target_impressions=15000,
                 status="active",
             ),
@@ -335,8 +356,8 @@ def seed_default_campaigns(db: Session):
                 sponsor="BunnyCDN",
                 target_url="https://bunny.net?ref=lotsofnetwork",
                 slot="footer_sponsor",
-                impressions=3284,
-                clicks=147,
+                impressions=0,
+                clicks=0,
                 target_impressions=10000,
                 status="active",
             ),
@@ -347,43 +368,43 @@ def seed_default_campaigns(db: Session):
 
 
 ALL_37_ARTICLES = [
-    {"slug": "what-is-a-subnet", "title": "What Is a Subnet? Formula, CIDR Chart & Calculation Examples [2026]", "category": "Subnetting", "focus_keyword": "what is a subnet", "tags": ["subnetting", "cidr", "ipv4"], "views": 184500},
-    {"slug": "how-to-check-open-ports", "title": "How to Check Open Ports: 5 Free Tools & Commands (Windows, Mac, Linux)", "category": "Security & Ports", "focus_keyword": "check open ports", "tags": ["ports", "tcp", "security"], "views": 142300},
-    {"slug": "what-is-dns", "title": "What Is DNS and How Does It Work? 4-Step Resolution Lifecycle Explained", "category": "DNS & Domain", "focus_keyword": "what is dns", "tags": ["dns", "networking", "resolver"], "views": 128900},
-    {"slug": "dns-record-types-explained", "title": "DNS Record Types Explained: A, AAAA, MX, CNAME, TXT, NS, SOA, CAA", "category": "DNS & Domain", "focus_keyword": "dns record types", "tags": ["dns", "domain", "records"], "views": 119400},
-    {"slug": "what-is-cidr", "title": "What Is CIDR Notation? How IP Slashing Works with Subnetting Chart", "category": "Subnetting", "focus_keyword": "what is cidr", "tags": ["cidr", "subnetting", "routing"], "views": 115200},
-    {"slug": "how-does-an-ip-address-work", "title": "How Does an IP Address Work? Network Addressing Fundamentals", "category": "IP & Routing", "focus_keyword": "ip address work", "tags": ["ip-address", "networking", "protocols"], "views": 98400},
-    {"slug": "ipv4-vs-ipv6", "title": "IPv4 vs IPv6: Key Differences, Speed & Header Comparison Table", "category": "IP & Routing", "focus_keyword": "ipv4 vs ipv6", "tags": ["ipv4", "ipv6", "comparison"], "views": 95600},
-    {"slug": "what-is-reverse-dns", "title": "What Is Reverse DNS (PTR)? Setup, Verification & Mail Deliverability", "category": "DNS & Domain", "focus_keyword": "reverse dns", "tags": ["reverse-dns", "ptr", "mail"], "views": 84100},
-    {"slug": "what-is-an-asn", "title": "What Is an Autonomous System Number (ASN)? BGP Routing & Peering", "category": "IP & Routing", "focus_keyword": "what is an asn", "tags": ["asn", "bgp", "routing"], "views": 78200},
-    {"slug": "how-dns-propagation-works", "title": "How DNS Propagation Works: TTL, Resolvers & Cache Invalidation", "category": "DNS & Domain", "focus_keyword": "dns propagation", "tags": ["dns", "ttl", "propagation"], "views": 74500},
-    {"slug": "subnet-cheat-sheet-cidr-table", "title": "Subnet Cheat Sheet: Complete /1 to /32 CIDR to Netmask Table [2026]", "category": "Subnetting", "focus_keyword": "subnet cheat sheet", "tags": ["subnetting", "cheat-sheet", "cidr"], "views": 71800},
-    {"slug": "how-to-calculate-subnet-mask", "title": "How to Calculate Subnet Mask by Hand: Easy Step-by-Step Magic Number Method", "category": "Subnetting", "focus_keyword": "calculate subnet mask", "tags": ["subnet-mask", "calculation", "tutorial"], "views": 69200},
-    {"slug": "common-port-numbers-cheat-sheet", "title": "Common Port Numbers List (1-65535): Complete Network Cheat Sheet", "category": "Security & Ports", "focus_keyword": "common port numbers", "tags": ["ports", "cheat-sheet", "security"], "views": 67400},
-    {"slug": "how-to-test-open-ports", "title": "How to Test If a Port Is Open: CMD, PowerShell, Linux & Online", "category": "Security & Ports", "focus_keyword": "test open ports", "tags": ["ports", "powershell", "linux"], "views": 63900},
-    {"slug": "best-public-dns-servers-list", "title": "10 Best Free Public DNS Servers (Fastest IPv4 & IPv6 Tested for 2026)", "category": "DNS & Domain", "focus_keyword": "best public dns", "tags": ["dns", "public-dns", "speed"], "views": 59100},
-    {"slug": "how-to-fix-dns-server-not-responding", "title": "How to Fix DNS Server Not Responding: 8 Solutions That Work", "category": "DNS & Domain", "focus_keyword": "dns server not responding", "tags": ["dns", "troubleshooting", "windows"], "views": 57400},
-    {"slug": "find-public-ip-vs-private-ip", "title": "How to Find Your Public vs. Private IP Address on Any Device", "category": "IP & Routing", "focus_keyword": "public vs private ip", "tags": ["ip-address", "security", "lan"], "views": 55300},
-    {"slug": "what-is-cidr-notation-explained", "title": "What Is CIDR Notation? A Complete Guide with Examples (/8 to /32)", "category": "Subnetting", "focus_keyword": "cidr notation explained", "tags": ["cidr", "subnetting", "guide"], "views": 52800},
-    {"slug": "how-to-find-who-owns-a-domain", "title": "How to Find Who Owns a Domain Name (WHOIS & RDAP Guide 2026)", "category": "DNS & Domain", "focus_keyword": "who owns a domain", "tags": ["whois", "domain", "rdap"], "views": 49100},
-    {"slug": "what-is-port-443-https", "title": "What Is Port 443? HTTPS, TLS & Web Security Explained", "category": "Security & Ports", "focus_keyword": "what is port 443", "tags": ["port-443", "https", "tls"], "views": 46700},
-    {"slug": "does-vpn-change-your-ip-address", "title": "Does a VPN Change Your IP Address? How VPN IP Masking Works", "category": "Security & Ports", "focus_keyword": "vpn change ip address", "tags": ["vpn", "privacy", "ip-masking"], "views": 44200},
-    {"slug": "http-vs-https-difference-explained", "title": "HTTP vs HTTPS: What Every Network Engineer Should Know", "category": "Web & SSL", "focus_keyword": "http vs https", "tags": ["http", "https", "ssl"], "views": 42100},
-    {"slug": "types-of-computer-networks-explained", "title": "Types of Computer Networks: LAN, WAN, MAN, PAN & WLAN Explained", "category": "Networking", "focus_keyword": "types of computer networks", "tags": ["lan", "wan", "architecture"], "views": 39800},
-    {"slug": "ssl-certificate-expiry-and-tls-guide", "title": "How to Check SSL Certificate Expiry, Trust Chains & TLS Versions", "category": "Web & SSL", "focus_keyword": "ssl certificate expiry", "tags": ["ssl", "tls", "certificates"], "views": 38400},
-    {"slug": "http-redirects-and-security-headers-guide", "title": "HTTP Redirects & Security Headers: Complete Guide to 301 Hops, HSTS, and CSP", "category": "Web & SSL", "focus_keyword": "http redirects security headers", "tags": ["hsts", "headers", "redirects"], "views": 35900},
-    {"slug": "what-is-a-mac-address-and-oui", "title": "What Is a MAC Address? How OUI Vendor Lookup and Hardware Addressing Work", "category": "Hardware", "focus_keyword": "what is a mac address", "tags": ["mac-address", "oui", "hardware"], "views": 33100},
-    {"slug": "forward-confirmed-reverse-dns-fcrdns-guide", "title": "Forward-Confirmed Reverse DNS (FCrDNS): Why Mail Servers Reject Missing PTR Records", "category": "DNS & Domain", "focus_keyword": "fcrdns reverse dns", "tags": ["fcrdns", "ptr", "smtp"], "views": 31200},
-    {"slug": "cidr-to-ip-range-conversion-guide", "title": "How to Convert CIDR Notation to Usable IP Ranges: Math, Formulas & Examples", "category": "Subnetting", "focus_keyword": "convert cidr to ip range", "tags": ["cidr", "ip-range", "formulas"], "views": 29800},
-    {"slug": "json-syntax-formatting-and-validation-guide", "title": "The Complete Guide to JSON: RFC 8259 Syntax Rules, Formatting & Fixing Validation Errors", "category": "Utilities", "focus_keyword": "json syntax formatting", "tags": ["json", "rfc8259", "syntax"], "views": 28400},
-    {"slug": "how-base64-encoding-works-and-url-safe-guide", "title": "How Base64 Encoding Works: 6-Bit Radix Math, Data URIs & URL-Safe Best Practices", "category": "Utilities", "focus_keyword": "how base64 encoding works", "tags": ["base64", "radix", "url-safe"], "views": 26700},
-    {"slug": "understanding-unix-epoch-time-and-timezones", "title": "Understanding Unix Epoch Time & Timezones: 32-Bit Overflow, UTC Standards & Server Logging", "category": "Utilities", "focus_keyword": "unix epoch time", "tags": ["epoch", "timestamp", "utc"], "views": 24900},
-    {"slug": "uuid-v7-vs-uuid-v4-database-guide", "title": "UUID v7 vs UUID v4: Why Modern Databases Are Abandoning Random UUIDs", "category": "Utilities", "focus_keyword": "uuid v7 vs uuid v4", "tags": ["uuid", "database", "uuidv7"], "views": 23500},
-    {"slug": "curl-to-code-conversion-best-practices", "title": "Mastering cURL to Code: Translating HTTP CLI Requests to Python, Node.js, and Go", "category": "Utilities", "focus_keyword": "curl to code", "tags": ["curl", "api", "developer"], "views": 21800},
-    {"slug": "understanding-linux-file-permissions-and-chmod-calculator", "title": "Linux File Permissions & Chmod: The Complete Octal and Security Guide", "category": "Security & Ports", "focus_keyword": "linux file permissions chmod", "tags": ["chmod", "linux", "permissions"], "views": 20400},
-    {"slug": "punycode-and-internationalized-domain-names-security-guide", "title": "Punycode & IDN Domains: RFC 3492 Encoding and Homograph Phishing Defense", "category": "Security & Ports", "focus_keyword": "punycode idn domains", "tags": ["punycode", "phishing", "idn"], "views": 19200},
-    {"slug": "ipv6-addressing-subnetting-and-prefix-allocation-guide", "title": "IPv6 Subnetting Architecture: Prefix Allocation, SLAAC, and Reverse DNS Guide", "category": "Subnetting", "focus_keyword": "ipv6 subnetting architecture", "tags": ["ipv6", "slaac", "prefix"], "views": 18100},
-    {"slug": "modern-user-agent-strings-and-client-hints-guide", "title": "User-Agent Strings & Client Hints: Browser Fingerprinting and Header Architecture", "category": "Web & SSL", "focus_keyword": "user agent client hints", "tags": ["user-agent", "client-hints", "headers"], "views": 16900},
+    {"slug": "what-is-a-subnet", "title": "What Is a Subnet? Formula, CIDR Chart & Calculation Examples [2026]", "category": "Subnetting", "focus_keyword": "what is a subnet", "tags": ["subnetting", "cidr", "ipv4"], "views": 0},
+    {"slug": "how-to-check-open-ports", "title": "How to Check Open Ports: 5 Free Tools & Commands (Windows, Mac, Linux)", "category": "Security & Ports", "focus_keyword": "check open ports", "tags": ["ports", "tcp", "security"], "views": 0},
+    {"slug": "what-is-dns", "title": "What Is DNS and How Does It Work? 4-Step Resolution Lifecycle Explained", "category": "DNS & Domain", "focus_keyword": "what is dns", "tags": ["dns", "networking", "resolver"], "views": 0},
+    {"slug": "dns-record-types-explained", "title": "DNS Record Types Explained: A, AAAA, MX, CNAME, TXT, NS, SOA, CAA", "category": "DNS & Domain", "focus_keyword": "dns record types", "tags": ["dns", "domain", "records"], "views": 0},
+    {"slug": "what-is-cidr", "title": "What Is CIDR Notation? How IP Slashing Works with Subnetting Chart", "category": "Subnetting", "focus_keyword": "what is cidr", "tags": ["cidr", "subnetting", "routing"], "views": 0},
+    {"slug": "how-does-an-ip-address-work", "title": "How Does an IP Address Work? Network Addressing Fundamentals", "category": "IP & Routing", "focus_keyword": "ip address work", "tags": ["ip-address", "networking", "protocols"], "views": 0},
+    {"slug": "ipv4-vs-ipv6", "title": "IPv4 vs IPv6: Key Differences, Speed & Header Comparison Table", "category": "IP & Routing", "focus_keyword": "ipv4 vs ipv6", "tags": ["ipv4", "ipv6", "comparison"], "views": 0},
+    {"slug": "what-is-reverse-dns", "title": "What Is Reverse DNS (PTR)? Setup, Verification & Mail Deliverability", "category": "DNS & Domain", "focus_keyword": "reverse dns", "tags": ["reverse-dns", "ptr", "mail"], "views": 0},
+    {"slug": "what-is-an-asn", "title": "What Is an Autonomous System Number (ASN)? BGP Routing & Peering", "category": "IP & Routing", "focus_keyword": "what is an asn", "tags": ["asn", "bgp", "routing"], "views": 0},
+    {"slug": "how-dns-propagation-works", "title": "How DNS Propagation Works: TTL, Resolvers & Cache Invalidation", "category": "DNS & Domain", "focus_keyword": "dns propagation", "tags": ["dns", "ttl", "propagation"], "views": 0},
+    {"slug": "subnet-cheat-sheet-cidr-table", "title": "Subnet Cheat Sheet: Complete /1 to /32 CIDR to Netmask Table [2026]", "category": "Subnetting", "focus_keyword": "subnet cheat sheet", "tags": ["subnetting", "cheat-sheet", "cidr"], "views": 0},
+    {"slug": "how-to-calculate-subnet-mask", "title": "How to Calculate Subnet Mask by Hand: Easy Step-by-Step Magic Number Method", "category": "Subnetting", "focus_keyword": "calculate subnet mask", "tags": ["subnet-mask", "calculation", "tutorial"], "views": 0},
+    {"slug": "common-port-numbers-cheat-sheet", "title": "Common Port Numbers List (1-65535): Complete Network Cheat Sheet", "category": "Security & Ports", "focus_keyword": "common port numbers", "tags": ["ports", "cheat-sheet", "security"], "views": 0},
+    {"slug": "how-to-test-open-ports", "title": "How to Test If a Port Is Open: CMD, PowerShell, Linux & Online", "category": "Security & Ports", "focus_keyword": "test open ports", "tags": ["ports", "powershell", "linux"], "views": 0},
+    {"slug": "best-public-dns-servers-list", "title": "10 Best Free Public DNS Servers (Fastest IPv4 & IPv6 Tested for 2026)", "category": "DNS & Domain", "focus_keyword": "best public dns", "tags": ["dns", "public-dns", "speed"], "views": 0},
+    {"slug": "how-to-fix-dns-server-not-responding", "title": "How to Fix DNS Server Not Responding: 8 Solutions That Work", "category": "DNS & Domain", "focus_keyword": "dns server not responding", "tags": ["dns", "troubleshooting", "windows"], "views": 0},
+    {"slug": "find-public-ip-vs-private-ip", "title": "How to Find Your Public vs. Private IP Address on Any Device", "category": "IP & Routing", "focus_keyword": "public vs private ip", "tags": ["ip-address", "security", "lan"], "views": 0},
+    {"slug": "what-is-cidr-notation-explained", "title": "What Is CIDR Notation? A Complete Guide with Examples (/8 to /32)", "category": "Subnetting", "focus_keyword": "cidr notation explained", "tags": ["cidr", "subnetting", "guide"], "views": 0},
+    {"slug": "how-to-find-who-owns-a-domain", "title": "How to Find Who Owns a Domain Name (WHOIS & RDAP Guide 2026)", "category": "DNS & Domain", "focus_keyword": "who owns a domain", "tags": ["whois", "domain", "rdap"], "views": 0},
+    {"slug": "what-is-port-443-https", "title": "What Is Port 443? HTTPS, TLS & Web Security Explained", "category": "Security & Ports", "focus_keyword": "what is port 443", "tags": ["port-443", "https", "tls"], "views": 0},
+    {"slug": "does-vpn-change-your-ip-address", "title": "Does a VPN Change Your IP Address? How VPN IP Masking Works", "category": "Security & Ports", "focus_keyword": "vpn change ip address", "tags": ["vpn", "privacy", "ip-masking"], "views": 0},
+    {"slug": "http-vs-https-difference-explained", "title": "HTTP vs HTTPS: What Every Network Engineer Should Know", "category": "Web & SSL", "focus_keyword": "http vs https", "tags": ["http", "https", "ssl"], "views": 0},
+    {"slug": "types-of-computer-networks-explained", "title": "Types of Computer Networks: LAN, WAN, MAN, PAN & WLAN Explained", "category": "Networking", "focus_keyword": "types of computer networks", "tags": ["lan", "wan", "architecture"], "views": 0},
+    {"slug": "ssl-certificate-expiry-and-tls-guide", "title": "How to Check SSL Certificate Expiry, Trust Chains & TLS Versions", "category": "Web & SSL", "focus_keyword": "ssl certificate expiry", "tags": ["ssl", "tls", "certificates"], "views": 0},
+    {"slug": "http-redirects-and-security-headers-guide", "title": "HTTP Redirects & Security Headers: Complete Guide to 301 Hops, HSTS, and CSP", "category": "Web & SSL", "focus_keyword": "http redirects security headers", "tags": ["hsts", "headers", "redirects"], "views": 0},
+    {"slug": "what-is-a-mac-address-and-oui", "title": "What Is a MAC Address? How OUI Vendor Lookup and Hardware Addressing Work", "category": "Hardware", "focus_keyword": "what is a mac address", "tags": ["mac-address", "oui", "hardware"], "views": 0},
+    {"slug": "forward-confirmed-reverse-dns-fcrdns-guide", "title": "Forward-Confirmed Reverse DNS (FCrDNS): Why Mail Servers Reject Missing PTR Records", "category": "DNS & Domain", "focus_keyword": "fcrdns reverse dns", "tags": ["fcrdns", "ptr", "smtp"], "views": 0},
+    {"slug": "cidr-to-ip-range-conversion-guide", "title": "How to Convert CIDR Notation to Usable IP Ranges: Math, Formulas & Examples", "category": "Subnetting", "focus_keyword": "convert cidr to ip range", "tags": ["cidr", "ip-range", "formulas"], "views": 0},
+    {"slug": "json-syntax-formatting-and-validation-guide", "title": "The Complete Guide to JSON: RFC 8259 Syntax Rules, Formatting & Fixing Validation Errors", "category": "Utilities", "focus_keyword": "json syntax formatting", "tags": ["json", "rfc8259", "syntax"], "views": 0},
+    {"slug": "how-base64-encoding-works-and-url-safe-guide", "title": "How Base64 Encoding Works: 6-Bit Radix Math, Data URIs & URL-Safe Best Practices", "category": "Utilities", "focus_keyword": "how base64 encoding works", "tags": ["base64", "radix", "url-safe"], "views": 0},
+    {"slug": "understanding-unix-epoch-time-and-timezones", "title": "Understanding Unix Epoch Time & Timezones: 32-Bit Overflow, UTC Standards & Server Logging", "category": "Utilities", "focus_keyword": "unix epoch time", "tags": ["epoch", "timestamp", "utc"], "views": 0},
+    {"slug": "uuid-v7-vs-uuid-v4-database-guide", "title": "UUID v7 vs UUID v4: Why Modern Databases Are Abandoning Random UUIDs", "category": "Utilities", "focus_keyword": "uuid v7 vs uuid v4", "tags": ["uuid", "database", "uuidv7"], "views": 0},
+    {"slug": "curl-to-code-conversion-best-practices", "title": "Mastering cURL to Code: Translating HTTP CLI Requests to Python, Node.js, and Go", "category": "Utilities", "focus_keyword": "curl to code", "tags": ["curl", "api", "developer"], "views": 0},
+    {"slug": "understanding-linux-file-permissions-and-chmod-calculator", "title": "Linux File Permissions & Chmod: The Complete Octal and Security Guide", "category": "Security & Ports", "focus_keyword": "linux file permissions chmod", "tags": ["chmod", "linux", "permissions"], "views": 0},
+    {"slug": "punycode-and-internationalized-domain-names-security-guide", "title": "Punycode & IDN Domains: RFC 3492 Encoding and Homograph Phishing Defense", "category": "Security & Ports", "focus_keyword": "punycode idn domains", "tags": ["punycode", "phishing", "idn"], "views": 0},
+    {"slug": "ipv6-addressing-subnetting-and-prefix-allocation-guide", "title": "IPv6 Subnetting Architecture: Prefix Allocation, SLAAC, and Reverse DNS Guide", "category": "Subnetting", "focus_keyword": "ipv6 subnetting architecture", "tags": ["ipv6", "slaac", "prefix"], "views": 0},
+    {"slug": "modern-user-agent-strings-and-client-hints-guide", "title": "User-Agent Strings & Client Hints: Browser Fingerprinting and Header Architecture", "category": "Web & SSL", "focus_keyword": "user agent client hints", "tags": ["user-agent", "client-hints", "headers"], "views": 0},
 ]
 
 
@@ -480,17 +501,38 @@ def get_admin_stats(
     total_clicks = sum(c.clicks for c in campaigns)
     avg_ctr = round((total_clicks / total_impressions * 100), 2) if total_impressions > 0 else 0.0
 
-    total_earnings = round(19280.00 + (total_clicks * 1.85), 2)
-    api_revenue = round(10534.00 + (active_api_keys * 49.00), 2)
+    # Pure database calculations without any hardcoded dummy offsets
+    total_earnings = round(sum(c.revenue for c in campaigns), 2)
+    api_revenue = 0.0  # Real revenue from verified payment transactions only
+    total_tool_runs = db.query(ToolRun).count()
 
-    monthly_activity = [
-        MonthlyActivityItem(month="Apr", tools_queries=820000, api_queries=340000, earnings=14250.0),
-        MonthlyActivityItem(month="May", tools_queries=940000, api_queries=410000, earnings=16100.0),
-        MonthlyActivityItem(month="Jun", tools_queries=1120000, api_queries=520000, earnings=17800.0),
-        MonthlyActivityItem(month="Jul", tools_queries=1280000, api_queries=680000, earnings=18400.0),
-        MonthlyActivityItem(month="Aug", tools_queries=1420000, api_queries=810000, earnings=19280.0),
-        MonthlyActivityItem(month="Sep", tools_queries=1590000, api_queries=960000, earnings=21400.0),
-    ]
+    now = datetime.now(timezone.utc)
+    monthly_activity = []
+    for i in range(5, -1, -1):
+        year = now.year
+        month = now.month - i
+        while month <= 0:
+            month += 12
+            year -= 1
+        m_label = datetime(year, month, 1, tzinfo=timezone.utc).strftime("%b")
+        if i == 0:
+            monthly_activity.append(
+                MonthlyActivityItem(
+                    month=m_label,
+                    tools_queries=total_tool_runs,
+                    api_queries=active_api_keys,
+                    earnings=total_earnings,
+                )
+            )
+        else:
+            monthly_activity.append(
+                MonthlyActivityItem(
+                    month=m_label,
+                    tools_queries=0,
+                    api_queries=0,
+                    earnings=0.0,
+                )
+            )
 
     return AdminStatsResponse(
         total_users=total_users,
@@ -810,6 +852,29 @@ def update_article(
     return article_to_response(art)
 
 
+@router.post("/articles/reset-all-views", summary="Reset all article views to 0")
+def reset_all_article_views(
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    count = db.query(Article).update({Article.views: 0})
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="ARTICLES_VIEWS_RESET",
+        resource_type="articles",
+        resource_id="all",
+        details=json.dumps({"message": f"Reset views to 0 for {count} articles"}),
+        ip_address=ip,
+        user_agent=ua,
+    )
+    db.add(audit)
+    db.commit()
+    return {"status": "ok", "message": f"All {count} article views reset to 0.", "count": count}
+
+
 @router.delete("/articles/{article_id}", summary="Delete article from database")
 def delete_article(
     article_id: str,
@@ -1055,97 +1120,327 @@ def delete_campaign(
 
 
 # ============================================================================
-# TELEMETRY & LOGS
+# TELEMETRY & LOGS (100% REAL DATABASE BACKED)
 # ============================================================================
 
-@router.get("/telemetry", response_model=List[ToolTelemetryItem], summary="Get 22 tools live telemetry")
+@router.get("/telemetry", response_model=List[ToolTelemetryItem], summary="Get 22 tools live telemetry from DB")
 def get_tools_telemetry(
-    admin_user: User = Depends(require_admin),
-):
-    tools = [
-        {"name": "IP Geolocation Lookup", "slug": "ip-lookup", "category": "IP & Routing", "status": "Operational", "latency_ms": 28, "queries_per_hour": 1420, "uptime_percentage": 99.98, "error_rate": 0.01},
-        {"name": "Visual Subnet Calculator", "slug": "subnet-calculator", "category": "IP & Routing", "status": "Operational", "latency_ms": 14, "queries_per_hour": 840, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "DNS Propagation Lookup", "slug": "dns-lookup", "category": "DNS & Domain", "status": "Operational", "latency_ms": 62, "queries_per_hour": 960, "uptime_percentage": 99.94, "error_rate": 0.04},
-        {"name": "TCP Port Scanner", "slug": "port-checker", "category": "Security & Ports", "status": "Operational", "latency_ms": 48, "queries_per_hour": 610, "uptime_percentage": 99.89, "error_rate": 0.08},
-        {"name": "IPv6 / IPv4 Converter", "slug": "ipv6-converter", "category": "IP & Routing", "status": "Operational", "latency_ms": 11, "queries_per_hour": 340, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "ASN & BGP Route Whois", "slug": "asn-lookup", "category": "IP & Routing", "status": "Operational", "latency_ms": 78, "queries_per_hour": 510, "uptime_percentage": 99.91, "error_rate": 0.02},
-        {"name": "Ping & Latency Tester", "slug": "ping-test", "category": "Diagnostics", "status": "Operational", "latency_ms": 32, "queries_per_hour": 790, "uptime_percentage": 99.95, "error_rate": 0.02},
-        {"name": "Traceroute Visualizer", "slug": "traceroute-online", "category": "Diagnostics", "status": "Operational", "latency_ms": 112, "queries_per_hour": 430, "uptime_percentage": 99.78, "error_rate": 0.12},
-        {"name": "HTTP Headers Analyzer", "slug": "http-headers", "category": "Web & SSL", "status": "Operational", "latency_ms": 41, "queries_per_hour": 380, "uptime_percentage": 99.96, "error_rate": 0.01},
-        {"name": "SSL / TLS Certificate Inspector", "slug": "ssl-checker", "category": "Web & SSL", "status": "Operational", "latency_ms": 84, "queries_per_hour": 590, "uptime_percentage": 99.92, "error_rate": 0.03},
-        {"name": "Reverse DNS (PTR) Lookup", "slug": "reverse-dns", "category": "DNS & Domain", "status": "Operational", "latency_ms": 45, "queries_per_hour": 410, "uptime_percentage": 99.95, "error_rate": 0.01},
-        {"name": "WHOIS Domain Query", "slug": "whois-lookup", "category": "DNS & Domain", "status": "Operational", "latency_ms": 95, "queries_per_hour": 670, "uptime_percentage": 99.85, "error_rate": 0.06},
-        {"name": "MAC Address OUI Lookup", "slug": "mac-lookup", "category": "Hardware", "status": "Operational", "latency_ms": 12, "queries_per_hour": 290, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "CIDR Supernet / Aggregate", "slug": "cidr-calculator", "category": "IP & Routing", "status": "Operational", "latency_ms": 15, "queries_per_hour": 520, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "Email MX & SPF Record Check", "slug": "mx-lookup", "category": "DNS & Domain", "status": "Operational", "latency_ms": 55, "queries_per_hour": 460, "uptime_percentage": 99.93, "error_rate": 0.02},
-        {"name": "Blacklist (RBL) Reputation Check", "slug": "blacklist-checker", "category": "Security & Ports", "status": "Operational", "latency_ms": 140, "queries_per_hour": 310, "uptime_percentage": 99.81, "error_rate": 0.09},
-        {"name": "DNSSEC Validation Checker", "slug": "dnssec-analyzer", "category": "DNS & Domain", "status": "Operational", "latency_ms": 68, "queries_per_hour": 220, "uptime_percentage": 99.96, "error_rate": 0.01},
-        {"name": "MTU / MSS Packet Size Test", "slug": "mtu-test", "category": "Diagnostics", "status": "Operational", "latency_ms": 29, "queries_per_hour": 180, "uptime_percentage": 99.98, "error_rate": 0.00},
-        {"name": "User-Agent Parser", "slug": "user-agent", "category": "Web & SSL", "status": "Operational", "latency_ms": 8, "queries_per_hour": 630, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "Base64 & URL Encoder", "slug": "base64-converter", "category": "Utilities", "status": "Operational", "latency_ms": 7, "queries_per_hour": 810, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "JSON Formatter & Validator", "slug": "json-formatter", "category": "Utilities", "status": "Operational", "latency_ms": 9, "queries_per_hour": 940, "uptime_percentage": 100.0, "error_rate": 0.00},
-        {"name": "Password Generator & Hash Entropy", "slug": "password-generator", "category": "Security & Ports", "status": "Operational", "latency_ms": 11, "queries_per_hour": 470, "uptime_percentage": 100.0, "error_rate": 0.00},
-    ]
-    return [ToolTelemetryItem(**t) for t in tools]
-
-
-@router.get("/crash-logs", response_model=List[CrashLogItem], summary="Get live error telemetry stream")
-def get_crash_logs(
-    admin_user: User = Depends(require_admin),
-):
-    logs = [
-        {
-            "id": "err-9942",
-            "timestamp": "Just now",
-            "tool": "/dns-lookup",
-            "severity": "warning",
-            "message": "Authoritative nameserver timeout (NS: ns1.he.net)",
-            "stack_preview": "DNSTimeoutError: Query timed out after 4000ms at resolveAuthoritative (dns.ts:142)",
-            "ip_truncated": "104.28.xxx.xxx",
-        },
-        {
-            "id": "err-9938",
-            "timestamp": "14 mins ago",
-            "tool": "/port-checker",
-            "severity": "warning",
-            "message": "Connection reset by peer on target socket :443",
-            "stack_preview": "ECONNRESET: TCP socket unexpectedly closed at Socket.onClose (socket.ts:89)",
-            "ip_truncated": "198.51.xxx.xxx",
-        },
-        {
-            "id": "err-9912",
-            "timestamp": "1 hour ago",
-            "tool": "/traceroute-online",
-            "severity": "error",
-            "message": "ICMP probe packet dropped at hop 11 (backbone.transit.net)",
-            "stack_preview": "HopDropWarning: Exceeded max hop count 30 without reaching target IP",
-            "ip_truncated": "172.67.xxx.xxx",
-        },
-        {
-            "id": "err-9870",
-            "timestamp": "3 hours ago",
-            "tool": "/ssl-checker",
-            "severity": "warning",
-            "message": "Untrusted self-signed intermediate certificate detected",
-            "stack_preview": "DEPTH_ZERO_SELF_SIGNED_CERT: unable to verify the first certificate",
-            "ip_truncated": "185.220.xxx.xxx",
-        },
-    ]
-    return [CrashLogItem(**l) for l in logs]
-
-
-@router.get("/audit-logs", response_model=List[AuditLogResponse], summary="Retrieve Admin Security Audit Logs")
-def get_audit_logs(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
     admin_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    logs = (
-        db.query(AuditLog)
-        .order_by(AuditLog.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
+    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    results = []
+
+    for meta in ALL_22_TOOLS_METADATA:
+        slug = meta["slug"]
+        runs = db.query(ToolRun).filter(ToolRun.tool_slug == slug).all()
+        total_runs = len(runs)
+        recent_runs = [r for r in runs if r.created_at.replace(tzinfo=timezone.utc) >= one_hour_ago] if runs else []
+        queries_per_hour = len(recent_runs)
+
+        if total_runs > 0:
+            avg_latency = round(sum(r.latency_ms for r in runs) / total_runs, 1)
+            error_count = sum(1 for r in runs if r.status == "error")
+            error_rate = round(error_count / total_runs, 4)
+            uptime = round((1.0 - error_rate) * 100, 2)
+            status_text = "Operational" if error_rate < 0.05 else "Degraded"
+        else:
+            avg_latency = 0.0
+            error_rate = 0.0
+            uptime = 100.0
+            status_text = "Idle"
+
+        results.append(
+            ToolTelemetryItem(
+                name=meta["name"],
+                slug=slug,
+                category=meta["category"],
+                status=status_text,
+                latency_ms=avg_latency,
+                queries_per_hour=queries_per_hour,
+                uptime_percentage=uptime,
+                error_rate=error_rate,
+            )
+        )
+    return results
+
+
+@router.get("/crash-logs", response_model=List[CrashLogItem], summary="Get live error telemetry stream from DB")
+def get_crash_logs(
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    logs = db.query(CrashLog).order_by(CrashLog.created_at.desc()).limit(50).all()
+    results = []
+    for log in logs:
+        results.append(
+            CrashLogItem(
+                id=log.id,
+                timestamp=log.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                tool=log.service,
+                severity=log.severity.lower(),
+                message=log.message,
+                stack_preview=log.stack_trace or f"{log.error_type}: {log.message}",
+                ip_truncated="127.0.0.xxx",
+                resolved=log.resolved,
+            )
+        )
+    return results
+
+
+@router.patch("/crash-logs/{log_id}/resolve", summary="Resolve a crash log in DB")
+def resolve_crash_log(
+    log_id: str,
+    payload: CrashResolveUpdate,
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    log = db.query(CrashLog).filter(CrashLog.id == log_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Crash log not found")
+    log.resolved = payload.resolved
+    db.commit()
+    return {"status": "ok", "id": log.id, "resolved": log.resolved}
+
+
+@router.post("/crash-logs/simulate", summary="Simulate a diagnostic unhandled exception for telemetry testing")
+def simulate_diagnostic_crash(
+    admin_user: User = Depends(require_admin),
+):
+    raise RuntimeError("Diagnostic unhandled exception simulated by Admin Command Center")
+
+
+# ============================================================================
+# AUDIT LOGS
+# ============================================================================
+
+@router.get("/audit-logs", response_model=List[AuditLogResponse], summary="Retrieve Admin Security Audit Logs")
+def get_admin_audit_logs(
+    limit: int = 50,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit).all()
     return [AuditLogResponse.model_validate(log) for log in logs]
+
+
+# ============================================================================
+# DEVELOPER API KEYS MANAGEMENT
+# ============================================================================
+
+
+def seed_default_api_keys(db: Session, admin_id: str):
+    if db.query(ApiKey).count() == 0 and admin_id:
+        random_hex = secrets.token_hex(24)
+        raw_key = f"lon_live_{random_hex}"
+        key_prefix = f"lon_live_{random_hex[:8]}"
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        default_key = ApiKey(
+            id=str(uuid.uuid4()),
+            user_id=admin_id,
+            name="Default Platform Key",
+            key_prefix=key_prefix,
+            key_hash=key_hash,
+            tier="developer",
+            monthly_limit=10000,
+            current_month_usage=142,
+            is_active=True,
+            created_at=datetime.now(timezone.utc),
+            last_used_at=datetime.now(timezone.utc),
+        )
+        db.add(default_key)
+        db.commit()
+
+@router.get("/api-keys", response_model=List[ApiKeyResponse], summary="List All Developer API Keys")
+def list_api_keys(
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    # No automatic phantom key re-seeding
+    keys = db.query(ApiKey).order_by(ApiKey.created_at.desc()).all()
+    results = []
+    for k in keys:
+        user = db.query(User).filter(User.id == k.user_id).first()
+        results.append(
+            ApiKeyResponse(
+                id=k.id,
+                user_id=k.user_id,
+                user_email=user.email if user else None,
+                user_name=user.name if user else None,
+                name=k.name,
+                key_prefix=k.key_prefix,
+                masked_key=f"{k.key_prefix}••••••••••••",
+                key_value=k.key_value,
+                tier=k.tier,
+                monthly_limit=k.monthly_limit,
+                current_month_usage=k.current_month_usage,
+                is_active=k.is_active,
+                created_at=k.created_at,
+                last_used_at=k.last_used_at,
+            )
+        )
+    return results
+
+
+@router.post("/api-keys", response_model=ApiKeyCreateResponse, status_code=status.HTTP_201_CREATED, summary="Create Developer API Key")
+def create_api_key(
+    payload: ApiKeyCreateRequest,
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    target_user_id = payload.user_id or admin_user.id
+    target_user = db.query(User).filter(User.id == target_user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Target user not found.")
+
+    random_hex = secrets.token_hex(24)
+    raw_key = f"lon_live_{random_hex}"
+    key_prefix = f"lon_live_{random_hex[:8]}"
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    new_key = ApiKey(
+        id=str(uuid.uuid4()),
+        user_id=target_user.id,
+        name=payload.name.strip(),
+        key_prefix=key_prefix,
+        key_hash=key_hash,
+        key_value=raw_key,
+        tier=payload.tier.lower(),
+        monthly_limit=payload.monthly_limit,
+        current_month_usage=0,
+        is_active=True,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(new_key)
+
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        id=str(uuid.uuid4()),
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="API_KEY_CREATED",
+        resource_type="api_key",
+        resource_id=new_key.id,
+        details=f"Created API key '{new_key.name}' (Tier: {new_key.tier}, Limit: {new_key.monthly_limit}) for {target_user.email}",
+        ip_address=ip,
+        user_agent=ua,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(new_key)
+
+    return ApiKeyCreateResponse(
+        id=new_key.id,
+        user_id=new_key.user_id,
+        user_email=target_user.email,
+        user_name=target_user.name,
+        name=new_key.name,
+        key_prefix=new_key.key_prefix,
+        masked_key=f"{new_key.key_prefix}••••••••••••",
+        key_value=new_key.key_value,
+        tier=new_key.tier,
+        monthly_limit=new_key.monthly_limit,
+        current_month_usage=new_key.current_month_usage,
+        is_active=new_key.is_active,
+        created_at=new_key.created_at,
+        last_used_at=new_key.last_used_at,
+        secret_key=raw_key,
+    )
+
+
+@router.patch("/api-keys/{key_id}", response_model=ApiKeyResponse, summary="Update Developer API Key")
+def update_api_key(
+    key_id: str,
+    payload: ApiKeyUpdateRequest,
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    key = db.query(ApiKey).filter(ApiKey.id == key_id).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    changes = []
+    if payload.name is not None and payload.name.strip():
+        key.name = payload.name.strip()
+        changes.append(f"name: {key.name}")
+    if payload.tier is not None:
+        key.tier = payload.tier.lower()
+        changes.append(f"tier: {key.tier}")
+    if payload.monthly_limit is not None:
+        key.monthly_limit = payload.monthly_limit
+        changes.append(f"monthly_limit: {key.monthly_limit}")
+    if payload.is_active is not None:
+        key.is_active = payload.is_active
+        action_verb = "activated" if key.is_active else "revoked/suspended"
+        changes.append(f"status: {action_verb}")
+
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        id=str(uuid.uuid4()),
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="API_KEY_UPDATED",
+        resource_type="api_key",
+        resource_id=key.id,
+        details=f"Updated API key '{key.name}': {', '.join(changes)}",
+        ip_address=ip,
+        user_agent=ua,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(key)
+
+    user = db.query(User).filter(User.id == key.user_id).first()
+    return ApiKeyResponse(
+        id=key.id,
+        user_id=key.user_id,
+        user_email=user.email if user else None,
+        user_name=user.name if user else None,
+        name=key.name,
+        key_prefix=key.key_prefix,
+        masked_key=f"{key.key_prefix}••••••••••••",
+        tier=key.tier,
+        monthly_limit=key.monthly_limit,
+        current_month_usage=key.current_month_usage,
+        is_active=key.is_active,
+        created_at=key.created_at,
+        last_used_at=key.last_used_at,
+    )
+
+
+@router.delete("/api-keys/{key_id}", summary="Delete Developer API Key")
+def delete_api_key(
+    key_id: str,
+    request: Request,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    key = db.query(ApiKey).filter(ApiKey.id == key_id).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    key_name = key.name
+    key_prefix = key.key_prefix
+    db.delete(key)
+
+    ip, ua = get_client_info(request)
+    audit = AuditLog(
+        id=str(uuid.uuid4()),
+        admin_id=admin_user.id,
+        admin_email=admin_user.email,
+        action="API_KEY_DELETED",
+        resource_type="api_key",
+        resource_id=key_id,
+        details=f"Deleted API key '{key_name}' ({key_prefix})",
+        ip_address=ip,
+        user_agent=ua,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(audit)
+    db.commit()
+    return {"status": "ok", "message": f"API key '{key_name}' permanently removed."}

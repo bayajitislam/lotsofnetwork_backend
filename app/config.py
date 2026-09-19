@@ -9,14 +9,21 @@ class Settings(BaseSettings):
     
     # Environment & Database
     ENV: str = "production"  # "development" | "production" | "test"
-    DATABASE_URL: str = "sqlite:///./lotsofnetwork.db"
+    DATABASE_URL: str = ""
+
+    def __init__(self, **values):
+        super().__init__(**values)
+        if not self.DATABASE_URL:
+            from pathlib import Path
+            root_dir = Path(__file__).resolve().parent.parent
+            self.DATABASE_URL = f"sqlite:///{root_dir / 'lotsofnetwork.db'}"
     
     # Security & JWT Tokens
     SECRET_KEY: str = "super-secret-key-change-in-production-lotsofnetwork-2026"
     REFRESH_SECRET_KEY: str = "super-refresh-secret-key-change-in-production-lotsofnetwork-2026"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30  # 30-minute short-lived access token
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 14     # 14-day refresh token
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 120  # 120-minute (2 hours) access token
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30    # 30-day persistent sliding session
     
     # Google OAuth 2.0 Web Client ID
     GOOGLE_CLIENT_ID: str = ""

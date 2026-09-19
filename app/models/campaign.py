@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, DateTime
+from sqlalchemy import Column, String, Integer, Float, DateTime
 from app.database import Base
 
 
@@ -14,6 +14,9 @@ class Campaign(Base):
     slot = Column(String(50), nullable=False, default="tool_header")
     impressions = Column(Integer, default=0, nullable=False)
     clicks = Column(Integer, default=0, nullable=False)
+    conversions = Column(Integer, default=0, nullable=False)  # Verified sales/purchases
+    revenue = Column(Float, default=0.0, nullable=False)      # Confirmed affiliate payout
+    payout_type = Column(String(30), default="affiliate_cpa", nullable=False)  # affiliate_cpa, cpc, cpm
     target_impressions = Column(Integer, default=50000, nullable=False)
     status = Column(String(20), default="active", nullable=False)  # active, paused, completed
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)

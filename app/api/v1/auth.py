@@ -147,9 +147,11 @@ def refresh_access_token(
         "ver": user.token_version,
     }
     new_access_token = create_access_token(data=new_claims)
+    new_refresh_token = create_refresh_token(data={"sub": user.id, "ver": user.token_version})
 
     return TokenRefreshResponse(
         access_token=new_access_token,
+        refresh_token=new_refresh_token,
         token_type="bearer",
     )
 
