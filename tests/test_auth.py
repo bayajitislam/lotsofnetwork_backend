@@ -9,7 +9,6 @@ from app.models.audit_log import AuditLog
 
 # Configure test environment
 settings.ENV = "test"
-settings.ALLOW_DEV_MOCK_AUTH = True
 
 client = TestClient(app)
 
