@@ -138,8 +138,8 @@ def create_checkout_session(
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Selected plan '{payload.plan_slug}' not found.")
 
-    # In development mode (when Stripe keys are not yet configured), enable instant simulated upgrade
-    if settings.ENV == "development" and (not settings.BILLING_ENABLED or not settings.STRIPE_SECRET_KEY):
+    # 1. Zero-cost plans (e.g. Free Tier) do not require Stripe checkout
+    if plan.price_cents == 0:
         sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
         if not sub:
             sub = Subscription(
@@ -153,7 +153,100 @@ def create_checkout_session(
             sub.plan_id = plan.id
             sub.status = "active"
 
-        # Sync user's active API keys to the new plan quota & rate limits!
+        # Sync user's active API keys to the free plan quota & rate limits
+        db.query(ApiKey).filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True).update(
+            {"tier": plan.slug, "monthly_limit": plan.monthly_limit, "rate_limit_rpm": plan.rate_limit_rpm},
+            synchronize_session=False,
+        )
+        db.commit()
+
+        return CheckoutSessionResponse(
+            checkout_url=payload.success_url or f"/dashboard?upgrade_success={plan.slug}",
+            session_id=f"free_sub_{uuid.uuid4().hex[:12]}",
+        )
+
+    # 2. Paid plans: attempt Stripe Checkout Session with either stripe_price_id or dynamic price_data
+    if settings.BILLING_ENABLED and settings.STRIPE_SECRET_KEY:
+        try:
+            import stripe
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+
+            if plan.stripe_price_id:
+                line_item = {"price": plan.stripe_price_id, "quantity": 1}
+            else:
+                line_item = {
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {
+                            "name": plan.name,
+                            "description": plan.description or f"Lots of Network {plan.name}",
+                        },
+                        "unit_amount": plan.price_cents,
+                        "recurring": {"interval": "month"},
+                    },
+                    "quantity": 1,
+                }
+
+            success_url = payload.success_url or "https://lotsofnetwork.com/dashboard?session_id={CHECKOUT_SESSION_ID}"
+            cancel_url = payload.cancel_url or "https://lotsofnetwork.com/dashboard"
+
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="subscription",
+                line_items=[line_item],
+                customer_email=current_user.email,
+                client_reference_id=current_user.id,
+                metadata={"user_id": current_user.id, "plan_id": plan.id, "plan_slug": plan.slug},
+                success_url=success_url,
+                cancel_url=cancel_url,
+            )
+            return CheckoutSessionResponse(checkout_url=session.url, session_id=session.id)
+        except Exception as exc:
+            # If in development mode, fallback to instant upgrade so testing is never blocked
+            if settings.ENV == "development":
+                sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
+                if not sub:
+                    sub = Subscription(
+                        id=str(uuid.uuid4()),
+                        user_id=current_user.id,
+                        plan_id=plan.id,
+                        status="active",
+                    )
+                    db.add(sub)
+                else:
+                    sub.plan_id = plan.id
+                    sub.status = "active"
+
+                db.query(ApiKey).filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True).update(
+                    {"tier": plan.slug, "monthly_limit": plan.monthly_limit, "rate_limit_rpm": plan.rate_limit_rpm},
+                    synchronize_session=False,
+                )
+                db.commit()
+
+                return CheckoutSessionResponse(
+                    checkout_url=payload.success_url or f"/dashboard?upgrade_success={plan.slug}",
+                    session_id=f"simulated_sub_{uuid.uuid4().hex[:12]}",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Stripe session creation failed: {str(exc)}",
+            )
+
+    # 3. If billing is disabled or in development mode without stripe keys
+    if settings.ENV == "development":
+        sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
+        if not sub:
+            sub = Subscription(
+                id=str(uuid.uuid4()),
+                user_id=current_user.id,
+                plan_id=plan.id,
+                status="active",
+            )
+            db.add(sub)
+        else:
+            sub.plan_id = plan.id
+            sub.status = "active"
+
         db.query(ApiKey).filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True).update(
             {"tier": plan.slug, "monthly_limit": plan.monthly_limit, "rate_limit_rpm": plan.rate_limit_rpm},
             synchronize_session=False,
@@ -165,41 +258,10 @@ def create_checkout_session(
             session_id=f"simulated_sub_{uuid.uuid4().hex[:12]}",
         )
 
-    try:
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-    except ImportError:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Stripe SDK is not installed on the server.",
-        )
-
-    if plan.price_cents == 0 or not plan.stripe_price_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This plan does not require a payment session or is missing a Stripe price ID.",
-        )
-
-    success_url = payload.success_url or "https://lotsofnetwork.com/developer?session_id={CHECKOUT_SESSION_ID}"
-    cancel_url = payload.cancel_url or "https://lotsofnetwork.com/developer"
-
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            mode="subscription",
-            line_items=[{"price": plan.stripe_price_id, "quantity": 1}],
-            customer_email=current_user.email,
-            client_reference_id=current_user.id,
-            metadata={"user_id": current_user.id, "plan_id": plan.id, "plan_slug": plan.slug},
-            success_url=success_url,
-            cancel_url=cancel_url,
-        )
-        return CheckoutSessionResponse(checkout_url=session.url, session_id=session.id)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Stripe session creation failed: {str(exc)}",
-        )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Billing is currently in setup mode. Stripe keys must be configured in production environment.",
+    )
 
 
 @router.post("/portal", response_model=CustomerPortalResponse, summary="Create Stripe Customer Portal session")
