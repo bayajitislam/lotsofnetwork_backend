@@ -83,12 +83,55 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+import ipaddress
+
+_LOOPBACK_OR_TEST = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _is_trusted_proxy(ip: str) -> bool:
+    """Check if the direct peer is a loopback or private network proxy."""
+    if not ip or ip == "unknown":
+        return False
+    if ip in _LOOPBACK_OR_TEST:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_loopback or addr.is_private
+    except ValueError:
+        return False
+
+
+def get_client_ip(request: Request) -> str:
+    """
+    Extracts the genuine client IP address with anti-spoofing protection.
+    Only honors proxy headers (CF-Connecting-IP, X-Real-IP, X-Forwarded-For)
+    if the direct connection originates from a trusted local/private reverse proxy.
+    """
+    peer_ip = request.client.host if request.client else "unknown"
+
+    if _is_trusted_proxy(peer_ip):
+        # 1. Cloudflare header (highest priority when behind Cloudflare)
+        cf_ip = request.headers.get("cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.strip()
+
+        # 2. NGINX / reverse proxy single real IP header
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip()
+
+        # 3. Standard X-Forwarded-For header
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            client_candidate = forwarded.split(",")[0].strip()
+            if client_candidate:
+                return client_candidate
+
+    return peer_ip
+
+
 def get_client_info(request: Request) -> tuple[str, str]:
     """Helper to extract client IP and user agent for audit logging."""
-    ip = request.client.host if request.client else "unknown"
-    # Check X-Forwarded-For if behind a reverse proxy (e.g. Cloudflare / NGINX)
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        ip = forwarded.split(",")[0].strip()
+    ip = get_client_ip(request)
     ua = request.headers.get("user-agent", "unknown")[:500]
     return ip, ua

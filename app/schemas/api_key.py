@@ -15,6 +15,7 @@ class ApiKeyResponse(BaseModel):
     # The key is shown exactly once at creation time via ApiKeyCreateResponse.secret_key.
     tier: str
     monthly_limit: int
+    rate_limit_rpm: int
     current_month_usage: int
     is_active: bool
     created_at: datetime
@@ -28,6 +29,7 @@ class ApiKeyCreateRequest(BaseModel):
     name: str = Field(default="Production API Key", min_length=2, max_length=128)
     tier: str = Field(default="developer")  # "free" | "developer" | "pro"
     monthly_limit: int = Field(default=10000, ge=100, le=10000000)
+    rate_limit_rpm: Optional[int] = Field(default=None, ge=1, le=10000)
 
 
 class ApiKeyCreateResponse(ApiKeyResponse):
@@ -38,4 +40,6 @@ class ApiKeyUpdateRequest(BaseModel):
     name: Optional[str] = None
     tier: Optional[str] = None
     monthly_limit: Optional[int] = None
+    rate_limit_rpm: Optional[int] = None
     is_active: Optional[bool] = None
+

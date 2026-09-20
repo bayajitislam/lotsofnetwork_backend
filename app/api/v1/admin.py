@@ -1437,6 +1437,7 @@ def list_api_keys(
                 # key_value intentionally omitted — raw keys are never stored or returned
                 tier=k.tier,
                 monthly_limit=k.monthly_limit,
+                rate_limit_rpm=k.rate_limit_rpm,
                 current_month_usage=k.current_month_usage,
                 is_active=k.is_active,
                 created_at=k.created_at,
@@ -1463,6 +1464,11 @@ def create_api_key(
     key_prefix = f"lon_live_{random_hex[:8]}"
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
+    rate_limit_rpm = payload.rate_limit_rpm
+    if not rate_limit_rpm:
+        plan = db.query(Plan).filter(Plan.slug == payload.tier.lower()).first()
+        rate_limit_rpm = plan.rate_limit_rpm if plan else 60
+
     new_key = ApiKey(
         id=str(uuid.uuid4()),
         user_id=target_user.id,
@@ -1472,6 +1478,7 @@ def create_api_key(
         # key_value intentionally NOT stored — raw key shown once at creation only
         tier=payload.tier.lower(),
         monthly_limit=payload.monthly_limit,
+        rate_limit_rpm=rate_limit_rpm,
         current_month_usage=0,
         is_active=True,
         created_at=datetime.now(timezone.utc),
@@ -1486,7 +1493,7 @@ def create_api_key(
         action="API_KEY_CREATED",
         resource_type="api_key",
         resource_id=new_key.id,
-        details=f"Created API key '{new_key.name}' (Tier: {new_key.tier}, Limit: {new_key.monthly_limit}) for {target_user.email}",
+        details=f"Created API key '{new_key.name}' (Tier: {new_key.tier}, Limit: {new_key.monthly_limit}, RPM: {new_key.rate_limit_rpm}) for {target_user.email}",
         ip_address=ip,
         user_agent=ua,
         created_at=datetime.now(timezone.utc),
@@ -1506,6 +1513,7 @@ def create_api_key(
         # key_value NOT included — use secret_key below (shown once only)
         tier=new_key.tier,
         monthly_limit=new_key.monthly_limit,
+        rate_limit_rpm=new_key.rate_limit_rpm,
         current_month_usage=new_key.current_month_usage,
         is_active=new_key.is_active,
         created_at=new_key.created_at,
@@ -1536,6 +1544,9 @@ def update_api_key(
     if payload.monthly_limit is not None:
         key.monthly_limit = payload.monthly_limit
         changes.append(f"monthly_limit: {key.monthly_limit}")
+    if payload.rate_limit_rpm is not None:
+        key.rate_limit_rpm = payload.rate_limit_rpm
+        changes.append(f"rate_limit_rpm: {key.rate_limit_rpm}")
     if payload.is_active is not None:
         key.is_active = payload.is_active
         action_verb = "activated" if key.is_active else "revoked/suspended"
@@ -1569,6 +1580,7 @@ def update_api_key(
         masked_key=f"{key.key_prefix}••••••••••••",
         tier=key.tier,
         monthly_limit=key.monthly_limit,
+        rate_limit_rpm=key.rate_limit_rpm,
         current_month_usage=key.current_month_usage,
         is_active=key.is_active,
         created_at=key.created_at,

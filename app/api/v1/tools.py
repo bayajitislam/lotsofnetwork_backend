@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.api_key import ApiKey
 from app.config import settings
+from app.api.deps import get_client_ip
 
 def create_safe_dns_resolver() -> dns.resolver.Resolver:
     try:
@@ -106,6 +107,22 @@ def validate_external_target(host: str) -> str:
 # Structure: { ip: deque of request timestamps }
 _anon_rate_store: Dict[str, collections.deque] = {}
 _rate_store_lock = threading.Lock()
+_MAX_RATE_STORE_ENTRIES = 20000
+
+
+def reset_rate_limit_stores() -> None:
+    """Helper to reset in-memory stores (used in test suites or administrative reset)."""
+    with _rate_store_lock:
+        _anon_rate_store.clear()
+    with _key_rate_store_lock:
+        _key_rate_store.clear()
+
+
+def _prune_stale_entries(store: Dict[str, collections.deque], now: float, window: float = 60.0) -> None:
+    """Evicts keys whose last recorded timestamp is older than the window to prevent memory leaks."""
+    stale_keys = [k for k, dq in store.items() if not dq or (now - dq[-1] > window)]
+    for k in stale_keys:
+        store.pop(k, None)
 
 
 def _check_anon_rate_limit(client_ip: str) -> None:
@@ -115,6 +132,9 @@ def _check_anon_rate_limit(client_ip: str) -> None:
     window = 60.0  # 1 minute sliding window
 
     with _rate_store_lock:
+        if len(_anon_rate_store) > _MAX_RATE_STORE_ENTRIES:
+            _prune_stale_entries(_anon_rate_store, now, window)
+
         if client_ip not in _anon_rate_store:
             _anon_rate_store[client_ip] = collections.deque()
 
@@ -131,6 +151,45 @@ def _check_anon_rate_limit(client_ip: str) -> None:
                     f"{limit} requests per minute. For higher limits, use a developer API key."
                 ),
                 headers={"Retry-After": "60"},
+            )
+
+        dq.append(now)
+
+
+# ============================================================================
+# PER-API-KEY RPM RATE LIMITER — In-memory sliding window per key ID.
+# Keyed by key UUID (not raw key string) so nothing sensitive is in memory.
+# ============================================================================
+
+_key_rate_store: Dict[str, collections.deque] = {}
+_key_rate_store_lock = threading.Lock()
+
+
+def _check_key_rate_limit(key_id: str, rpm_limit: int) -> None:
+    """Enforce rate_limit_rpm requests per minute for a specific API key."""
+    now = time.monotonic()
+    window = 60.0  # 1 minute sliding window
+
+    with _key_rate_store_lock:
+        if len(_key_rate_store) > _MAX_RATE_STORE_ENTRIES:
+            _prune_stale_entries(_key_rate_store, now, window)
+
+        if key_id not in _key_rate_store:
+            _key_rate_store[key_id] = collections.deque()
+
+        dq = _key_rate_store[key_id]
+        # Evict timestamps outside the sliding window
+        while dq and now - dq[0] > window:
+            dq.popleft()
+
+        if len(dq) >= rpm_limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Rate limit exceeded. Your plan allows {rpm_limit} requests/minute. "
+                    f"Slow down or upgrade your plan for a higher rate limit."
+                ),
+                headers={"Retry-After": "60", "X-Rate-Limit-RPM": str(rpm_limit)},
             )
 
         dq.append(now)
@@ -172,8 +231,8 @@ def verify_and_meter_api_key(request: Request, db: Session = Depends(get_db)) ->
             api_key_str = auth_header.replace("Bearer ", "", 1).strip()
 
     if not api_key_str:
-        # Anonymous web user — enforce IP-based rate limit
-        client_ip = request.client.host if request.client else "unknown"
+        # Anonymous web user — enforce IP-based rate limit using secure anti-spoofing resolver
+        client_ip = get_client_ip(request)
         _check_anon_rate_limit(client_ip)
         return None
 
@@ -192,6 +251,9 @@ def verify_and_meter_api_key(request: Request, db: Session = Depends(get_db)) ->
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API Key has been revoked or suspended by platform administrator.",
         )
+
+    # Per-key RPM enforcement (before monthly quota — fast, no DB write needed)
+    _check_key_rate_limit(key_obj.id, key_obj.rate_limit_rpm)
 
     # Reset quota if we've crossed into a new calendar month
     _maybe_reset_monthly_quota(key_obj, db)
@@ -755,22 +817,6 @@ async def dns_lookup(payload: DnsLookupRequest):
             continue
 
     latency_ms = (time.perf_counter() - start_time) * 1000
-
-    if not records:
-        records.append(
-            DnsRecordItem(
-                record_type="A",
-                value="104.21.48.1",
-                ttl=300,
-            )
-        )
-        records.append(
-            DnsRecordItem(
-                record_type="NS",
-                value="ns1.cloudflare.com.",
-                ttl=86400,
-            )
-        )
 
     record_tool_execution(
         tool_slug="dns-lookup",

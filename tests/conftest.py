@@ -45,6 +45,15 @@ def create_tables():
     # Base.metadata.drop_all(bind=engine)
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limits():
+    """Ensure in-memory rate stores are cleared before and after each test."""
+    from app.api.v1.tools import reset_rate_limit_stores
+    reset_rate_limit_stores()
+    yield
+    reset_rate_limit_stores()
+
+
 # ---------------------------------------------------------------------------
 # 3. Shared clean-slate fixture — used by tests that need an empty DB.
 #    Tests that already have their own `clean_db` fixture are unaffected.

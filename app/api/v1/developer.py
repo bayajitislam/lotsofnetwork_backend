@@ -48,6 +48,7 @@ def list_developer_keys(
                 masked_key=f"{k.key_prefix}••••••••••••",
                 tier=k.tier,
                 monthly_limit=k.monthly_limit,
+                rate_limit_rpm=k.rate_limit_rpm,
                 current_month_usage=k.current_month_usage,
                 is_active=k.is_active,
                 created_at=k.created_at,
@@ -88,6 +89,7 @@ def create_developer_key(
     plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
     tier_slug = plan.slug if plan else "free"
     monthly_limit = plan.monthly_limit if plan else 1000
+    rate_limit_rpm = plan.rate_limit_rpm if plan else 60
 
     # Key generation: 24 random hex bytes (48 hex chars)
     random_hex = secrets.token_hex(24)
@@ -103,6 +105,7 @@ def create_developer_key(
         key_hash=key_hash,
         tier=tier_slug,
         monthly_limit=monthly_limit,
+        rate_limit_rpm=rate_limit_rpm,
         current_month_usage=0,
         is_active=True,
         created_at=datetime.now(timezone.utc),
@@ -121,6 +124,7 @@ def create_developer_key(
         masked_key=f"{new_key.key_prefix}••••••••••••",
         tier=new_key.tier,
         monthly_limit=new_key.monthly_limit,
+        rate_limit_rpm=new_key.rate_limit_rpm,
         current_month_usage=new_key.current_month_usage,
         is_active=new_key.is_active,
         created_at=new_key.created_at,

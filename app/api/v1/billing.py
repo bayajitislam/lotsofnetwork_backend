@@ -251,6 +251,11 @@ async def stripe_webhook(
         if user_id and plan_id:
             plan = db.query(Plan).filter(Plan.id == plan_id).first()
             sub = db.query(Subscription).filter(Subscription.user_id == user_id).first()
+
+            # Idempotency: skip if this stripe_subscription_id is already recorded
+            if subscription_id and sub and sub.stripe_subscription_id == subscription_id:
+                return {"status": "already_processed", "event": event_type}
+
             if not sub:
                 sub = Subscription(
                     id=str(uuid.uuid4()),
@@ -267,10 +272,10 @@ async def stripe_webhook(
                 sub.stripe_subscription_id = subscription_id
                 sub.status = "active"
 
-            # Sync active API keys to the new plan quota!
+            # Sync active API keys to the new plan quota and RPM!
             if plan:
                 db.query(ApiKey).filter(ApiKey.user_id == user_id, ApiKey.is_active == True).update(
-                    {"monthly_limit": plan.monthly_limit},
+                    {"monthly_limit": plan.monthly_limit, "rate_limit_rpm": plan.rate_limit_rpm},
                     synchronize_session=False,
                 )
             db.commit()
@@ -299,7 +304,7 @@ async def stripe_webhook(
                 if free_plan:
                     sub.plan_id = free_plan.id
                     db.query(ApiKey).filter(ApiKey.user_id == sub.user_id, ApiKey.is_active == True).update(
-                        {"monthly_limit": free_plan.monthly_limit},
+                        {"monthly_limit": free_plan.monthly_limit, "rate_limit_rpm": free_plan.rate_limit_rpm},
                         synchronize_session=False,
                     )
             db.commit()

@@ -25,8 +25,9 @@ async def lifespan(app: FastAPI):
     settings.validate_production_secrets()
 
     # Initialize / update database tables
-    # NOTE: This will be replaced by `alembic upgrade head` in FIX-03.
-    #       For now, create_all is safe for SQLite dev and initial Supabase setup.
+    # DEV/TEST: create_all is safe for SQLite and initial Supabase setup.
+    # PRODUCTION: Run `alembic upgrade head` before starting the server instead.
+    #             Set ALEMBIC_ON_STARTUP=true to run it automatically (see config.py).
     Base.metadata.create_all(bind=get_engine())
     yield
 
@@ -35,9 +36,9 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     description="Backend API for Lots of Network tools, API monetisation, and Admin Portal.",
-    openapi_url="/openapi.json",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
     lifespan=lifespan,
 )
 
@@ -80,13 +81,27 @@ def root():
         "service": settings.PROJECT_NAME,
         "version": settings.VERSION,
         "status": "online",
-        "docs": "/docs",
+        "docs": None if settings.is_production else "/docs",
     }
 
 
 @app.get("/health", tags=["Health"])
 def health_check():
-    return {"status": "ok"}
+    """Liveness and database connectivity probe."""
+    try:
+        from app.database import SessionLocal
+        from sqlalchemy import text
+        db = SessionLocal()
+        try:
+            db.execute(text("SELECT 1"))
+        finally:
+            db.close()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "database": "disconnected"},
+        )
+    return {"status": "ok", "database": "connected"}
 
 # ============================================================================
 # UNCAUGHT CRASH & EXCEPTION TELEMETRY PIPELINE
@@ -117,7 +132,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             error_type=error_type,
             message=message[:500],
             severity="HIGH",
-            stack_trace=stack_trace,
+            stack_trace=stack_trace[:5000],  # Capped to 5000 chars to prevent DB bloat
             resolved=False,
         )
         db.add(crash)
@@ -126,11 +141,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     except Exception as log_err:
         print(f"[CrashLogger Error] Failed to persist crash log: {log_err}")
 
+    # Note: error_type is omitted from public response to prevent class-name leaking
     return JSONResponse(
         status_code=500,
         content={
             "detail": "An internal server error occurred.",
             "error_id": crash_id,
-            "error_type": error_type,
         },
     )

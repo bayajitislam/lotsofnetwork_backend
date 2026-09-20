@@ -19,6 +19,7 @@ from app.services.google_auth import verify_google_id_token
 from app.services.security import (
     create_access_token,
     create_refresh_token,
+    decode_access_token,
     decode_refresh_token,
 )
 from app.api.deps import get_current_user
@@ -71,8 +72,62 @@ def _clear_auth_cookies(response: Response):
 def set_auth_cookies(
     payload: SetCookiesRequest,
     response: Response,
+    db: Session = Depends(get_db),
 ):
-    """Explicitly set access and refresh token cookies."""
+    """
+    Explicitly set access and refresh token cookies after cryptographically
+    verifying token signatures and confirming the user exists and is active.
+    """
+    # 1. Verify access token signature and structure
+    access_payload = decode_access_token(payload.access_token)
+    if not access_payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user_id = access_payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Malformed access token payload.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 2. Verify user in database
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account not found.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account has been deactivated.",
+        )
+
+    # 3. Check token version revocation
+    token_ver = access_payload.get("ver")
+    if token_ver is not None and token_ver != user.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has been revoked. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 4. If refresh token provided, verify its signature and matching user
+    if payload.refresh_token:
+        refresh_payload = decode_refresh_token(payload.refresh_token)
+        if not refresh_payload or refresh_payload.get("sub") != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or mismatched refresh token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     _set_auth_cookies(response, payload.access_token, payload.refresh_token)
     return {"message": "Auth cookies updated successfully"}
 
@@ -90,8 +145,14 @@ def developer_login(
 ):
     """
     Direct developer sign-in or auto-registration for the developer portal.
-    Issues JWT access token, refresh token, and session cookies.
+    DISABLED IN PRODUCTION for security.
     """
+    if settings.ENV == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Developer direct login is disabled in production. Please authenticate with Google.",
+        )
+
     email = payload.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(
@@ -114,7 +175,6 @@ def developer_login(
         user = User(
             email=email,
             name=payload.name or "Developer",
-            google_id=f"dev_{uuid.uuid4().hex[:16]}",
             role=target_role,
             is_active=True,
             token_version=1,

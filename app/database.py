@@ -6,8 +6,7 @@ Base = declarative_base()
 
 # ---------------------------------------------------------------------------
 # Lazy engine — created on first access so that:
-#   1. Tests can override settings.ENV / settings.DATABASE_URL before the
-#      engine is instantiated.
+#   1. Tests can override settings.DATABASE_URL before the engine is built.
 #   2. The server doesn't blow up at import time if DATABASE_URL is empty
 #      (validate_production_secrets() in main.py catches that at startup).
 # ---------------------------------------------------------------------------
@@ -19,13 +18,14 @@ def _get_engine():
     global _engine
     if _engine is None:
         db_url = settings.DATABASE_URL
-        from pathlib import Path
-        root_dir = Path(__file__).resolve().parent.parent
-        sqlite_url = f"sqlite:///{root_dir / 'lotsofnetwork.db'}"
 
         if not db_url:
-            raise RuntimeError("DATABASE_URL is not configured. PostgreSQL connection string is required.")
+            raise RuntimeError(
+                "DATABASE_URL is not configured. "
+                "Set a PostgreSQL connection string in your .env file."
+            )
 
+        # Normalise legacy postgres:// and bare postgresql:// → postgresql+psycopg://
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
         elif db_url.startswith("postgresql://") and not any(
@@ -33,18 +33,15 @@ def _get_engine():
         ):
             db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-        connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
-        pool_kwargs = {}
-        if not db_url.startswith("sqlite"):
-            pool_kwargs = {
-                "pool_size": 10,
-                "max_overflow": 20,
-                "pool_pre_ping": True,
-            }
-        _engine = create_engine(db_url, connect_args=connect_args, **pool_kwargs)
+        _engine = create_engine(
+            db_url,
+            pool_size=10,
+            max_overflow=20,
+            pool_pre_ping=True,
+        )
         with _engine.connect() as conn:
             pass
-        print(f"[DATABASE] Successfully connected to PostgreSQL: {db_url.split('@')[-1]}")
+        print(f"[DATABASE] Connected to PostgreSQL: {db_url.split('@')[-1]}")
     return _engine
 
 
@@ -53,11 +50,6 @@ def _get_session_factory():
     if _SessionLocal is None:
         _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_get_engine())
     return _SessionLocal
-
-
-@property  # type: ignore[misc]
-def engine(_):
-    return _get_engine()
 
 
 # Public surface used throughout the app

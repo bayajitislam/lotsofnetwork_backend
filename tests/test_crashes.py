@@ -16,13 +16,15 @@ def test_unhandled_exception_global_handler():
     assert resp.status_code == 500
     data = resp.json()
     assert "error_id" in data
-    assert data["error_type"] == "RuntimeError"
+    # Security check: error_type should NOT be leaked in public 500 response
+    assert "error_type" not in data
     crash_id = data["error_id"]
 
-    # Verify CrashLog was saved to database
+    # Verify CrashLog was saved to database with internal details
     db = SessionLocal()
     crash = db.query(CrashLog).filter(CrashLog.id == crash_id).first()
     assert crash is not None
+    assert crash.error_type == "RuntimeError"
     assert crash.severity == "HIGH"
     assert "Diagnostic unhandled exception" in crash.message
     assert crash.resolved is False

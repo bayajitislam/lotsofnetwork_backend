@@ -13,8 +13,9 @@ class ApiKey(Base):
     key_prefix = Column(String(32), nullable=False)  # e.g., "lon_live_1a2b3c4d"
     key_hash = Column(String(64), unique=True, index=True, nullable=False)  # sha256 of the full key
     # key_value intentionally removed — raw keys are NEVER stored. Show once at creation only.
-    tier = Column(String(32), default="free", nullable=False)  # "free" | "developer" | "pro"
+    tier = Column(String(32), default="free", nullable=False)  # "free" | "pro" | "enterprise"
     monthly_limit = Column(Integer, default=1000, nullable=False)
+    rate_limit_rpm = Column(Integer, default=60, nullable=False)   # requests per minute for this key
     current_month_usage = Column(Integer, default=0, nullable=False)
     quota_reset_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)

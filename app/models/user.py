@@ -11,7 +11,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     name = Column(String(255), nullable=True)
     avatar = Column(String(1024), nullable=True)
-    google_id = Column(String(255), unique=True, index=True, nullable=False)
+    google_id = Column(String(255), unique=True, index=True, nullable=True)  # None for developer-login users
     role = Column(String(32), default="user", nullable=False)  # "admin" | "user"
     is_active = Column(Boolean, default=True, nullable=False)
     token_version = Column(Integer, default=1, nullable=False)  # Incremented to revoke all active tokens

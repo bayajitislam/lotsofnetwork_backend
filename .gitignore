@@ -43,3 +43,7 @@ ENV/
 
 # Logs
 *.log
+
+# Uploads
+uploads/*
+!uploads/.gitkeep

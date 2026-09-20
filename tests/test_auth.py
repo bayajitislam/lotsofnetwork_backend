@@ -187,3 +187,73 @@ def test_refresh_token_sliding_window():
     me_res = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {ref_data['access_token']}"})
     assert me_res.status_code == 200
     assert me_res.json()["role"] == "admin"
+
+
+def test_developer_login_disabled_in_production():
+    original_env = settings.ENV
+    try:
+        settings.ENV = "production"
+        resp = client.post("/api/v1/auth/developer-login", json={"email": "attacker@example.com"})
+        assert resp.status_code == 403
+        assert "disabled in production" in resp.json()["detail"].lower()
+    finally:
+        settings.ENV = original_env
+
+
+def test_set_cookies_requires_valid_token():
+    # 1. Bogus access token must be rejected
+    resp = client.post("/api/v1/auth/set-cookies", json={
+        "access_token": "forged.token.payload",
+        "refresh_token": "forged.refresh.payload"
+    })
+    assert resp.status_code == 401
+    assert "invalid" in resp.json()["detail"].lower() or "expired" in resp.json()["detail"].lower()
+
+
+def test_set_cookies_successful_with_valid_token():
+    # 1. Obtain legitimate tokens
+    token = generate_mock_google_token("cookie_test@example.com", "Cookie Tester", "sub_cookie_01")
+    auth_data = client.post("/api/v1/auth/google", json={"credential": token}).json()
+    access_token = auth_data["access_token"]
+    refresh_token = auth_data["refresh_token"]
+
+    # 2. Call set-cookies with genuine token
+    resp = client.post("/api/v1/auth/set-cookies", json={
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    })
+    assert resp.status_code == 200
+    assert "access_token" in resp.cookies
+    assert "refresh_token" in resp.cookies
+
+
+def test_health_check_database_probe():
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["database"] == "connected"
+
+
+def test_validate_production_secrets_checks_stripe_when_billing_enabled():
+    original_billing = settings.BILLING_ENABLED
+    original_stripe_sec = settings.STRIPE_SECRET_KEY
+    original_stripe_wh = settings.STRIPE_WEBHOOK_SECRET
+    original_env = settings.ENV
+
+    try:
+        settings.ENV = "production"
+        settings.BILLING_ENABLED = True
+        settings.STRIPE_SECRET_KEY = ""
+        settings.STRIPE_WEBHOOK_SECRET = ""
+
+        with pytest.raises(ValueError) as excinfo:
+            settings.validate_production_secrets()
+        assert "STRIPE_SECRET_KEY" in str(excinfo.value)
+        assert "STRIPE_WEBHOOK_SECRET" in str(excinfo.value)
+    finally:
+        settings.ENV = original_env
+        settings.BILLING_ENABLED = original_billing
+        settings.STRIPE_SECRET_KEY = original_stripe_sec
+        settings.STRIPE_WEBHOOK_SECRET = original_stripe_wh
+

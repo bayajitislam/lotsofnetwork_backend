@@ -31,11 +31,6 @@ class Settings(BaseSettings):
 
     def __init__(self, **values):
         super().__init__(**values)
-        # SQLite fallback only for local dev/test — never production
-        if not self.DATABASE_URL and self.ENV in ("development", "test"):
-            from pathlib import Path
-            root_dir = Path(__file__).resolve().parent.parent
-            self.DATABASE_URL = f"sqlite:///{root_dir / 'lotsofnetwork.db'}"
 
     # -----------------------------------------------------------------------
     # Security & JWT Tokens
@@ -89,11 +84,15 @@ class Settings(BaseSettings):
     # -----------------------------------------------------------------------
     # Rate limiting (anonymous web users — no API key)
     # -----------------------------------------------------------------------
-    ANON_RATE_LIMIT_PER_MINUTE: int = 100  # requests per IP per minute
+    ANON_RATE_LIMIT_PER_MINUTE: int = 20  # requests per IP per minute
 
     # -----------------------------------------------------------------------
     # Computed properties
     # -----------------------------------------------------------------------
+    @property
+    def is_production(self) -> bool:
+        return self.ENV == "production"
+
     @property
     def admin_email_list(self) -> List[str]:
         return [e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()]
@@ -107,9 +106,6 @@ class Settings(BaseSettings):
         from pathlib import Path
         return str(Path(__file__).resolve().parent.parent / "uploads")
 
-    @property
-    def is_sqlite(self) -> bool:
-        return self.DATABASE_URL.startswith("sqlite")
 
     @property
     def cloudinary_configured(self) -> bool:
@@ -132,6 +128,12 @@ class Settings(BaseSettings):
             val = getattr(self, key, "")
             if not val:
                 missing.append(key)
+
+        if self.BILLING_ENABLED:
+            if not self.STRIPE_SECRET_KEY:
+                missing.append("STRIPE_SECRET_KEY (BILLING_ENABLED=True)")
+            if not self.STRIPE_WEBHOOK_SECRET:
+                missing.append("STRIPE_WEBHOOK_SECRET (BILLING_ENABLED=True)")
 
         if missing:
             raise ValueError(
