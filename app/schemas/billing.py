@@ -23,6 +23,10 @@ class SubscriptionResponse(BaseModel):
     id: str
     user_id: str
     plan: PlanResponse
+    plan_slug: Optional[str] = None
+    plan_name: Optional[str] = None
+    monthly_limit: Optional[int] = None
+    rate_limit_rpm: Optional[int] = None
     status: str
     current_period_start: Optional[datetime] = None
     current_period_end: Optional[datetime] = None

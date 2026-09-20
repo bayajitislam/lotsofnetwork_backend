@@ -20,7 +20,7 @@ router = APIRouter(prefix="/developer", tags=["Developer Portal"])
 
 
 class DeveloperKeyCreateRequest(BaseModel):
-    name: str = Field(default="Primary Developer Key", min_length=2, max_length=128)
+    name: Optional[str] = Field(default="Primary Developer Key", max_length=128)
 
 
 @router.get("/keys", response_model=List[ApiKeyResponse], summary="List developer API keys")
@@ -37,6 +37,7 @@ def list_developer_keys(
     )
     results = []
     for k in keys:
+        rpm = getattr(k, "rate_limit_rpm", None) or 60
         results.append(
             ApiKeyResponse(
                 id=k.id,
@@ -48,7 +49,7 @@ def list_developer_keys(
                 masked_key=f"{k.key_prefix}••••••••••••",
                 tier=k.tier,
                 monthly_limit=k.monthly_limit,
-                rate_limit_rpm=k.rate_limit_rpm,
+                rate_limit_rpm=rpm,
                 current_month_usage=k.current_month_usage,
                 is_active=k.is_active,
                 created_at=k.created_at,
@@ -72,21 +73,29 @@ def create_developer_key(
     """Generates a cryptographically secure developer API key linked to the user's active subscription tier."""
     ensure_default_plans(db)
 
+    # Sanitize key name
+    key_name = (payload.name or "").strip()
+    if not key_name or len(key_name) < 2:
+        key_name = "Primary Developer Key"
+
     # Resolve active subscription and plan tier
+    free_plan = db.query(Plan).filter(Plan.slug == "free").first()
     sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
     if not sub:
-        free_plan = db.query(Plan).filter(Plan.slug == "free").first()
         sub = Subscription(
             id=str(uuid.uuid4()),
             user_id=current_user.id,
-            plan_id=free_plan.id if free_plan else "free",
+            plan_id=free_plan.id if free_plan else str(uuid.uuid4()),
             status="active",
         )
         db.add(sub)
         db.commit()
         db.refresh(sub)
 
-    plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
+    plan = db.query(Plan).filter(Plan.id == sub.plan_id).first() if sub else None
+    if not plan and free_plan:
+        plan = free_plan
+
     tier_slug = plan.slug if plan else "free"
     monthly_limit = plan.monthly_limit if plan else 1000
     rate_limit_rpm = plan.rate_limit_rpm if plan else 60
@@ -97,18 +106,20 @@ def create_developer_key(
     key_prefix = f"lon_live_{random_hex[:8]}"
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
+    now = datetime.now(timezone.utc)
     new_key = ApiKey(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        name=payload.name.strip(),
+        name=key_name,
         key_prefix=key_prefix,
         key_hash=key_hash,
         tier=tier_slug,
         monthly_limit=monthly_limit,
         rate_limit_rpm=rate_limit_rpm,
         current_month_usage=0,
+        quota_reset_at=now,
         is_active=True,
-        created_at=datetime.now(timezone.utc),
+        created_at=now,
     )
     db.add(new_key)
     db.commit()

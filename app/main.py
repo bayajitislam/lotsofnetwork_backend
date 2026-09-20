@@ -25,10 +25,35 @@ async def lifespan(app: FastAPI):
     settings.validate_production_secrets()
 
     # Initialize / update database tables
-    # DEV/TEST: create_all is safe for SQLite and initial Supabase setup.
-    # PRODUCTION: Run `alembic upgrade head` before starting the server instead.
-    #             Set ALEMBIC_ON_STARTUP=true to run it automatically (see config.py).
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+
+    # Dynamic schema patch: ensure rate_limit_rpm exists on api_keys table
+    try:
+        from sqlalchemy import inspect, text
+        inspector = inspect(engine)
+        if "api_keys" in inspector.get_table_names():
+            col_names = [c["name"] for c in inspector.get_columns("api_keys")]
+            if "rate_limit_rpm" not in col_names:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE api_keys ADD COLUMN rate_limit_rpm INTEGER DEFAULT 60 NOT NULL"))
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(f"Note on dynamic rate_limit_rpm column check: {exc}")
+
+    # Seed default billing plans if empty
+    try:
+        from app.database import SessionLocal
+        from app.api.v1.billing import ensure_default_plans
+        db = SessionLocal()
+        try:
+            ensure_default_plans(db)
+        finally:
+            db.close()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(f"Note on default plans initialization: {exc}")
+
     yield
 
 

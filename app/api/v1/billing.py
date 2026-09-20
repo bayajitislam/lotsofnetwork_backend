@@ -102,10 +102,15 @@ def get_user_subscription(
         db.refresh(sub)
 
     plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
+    plan_resp = PlanResponse.model_validate(plan) if plan else None
     return SubscriptionResponse(
         id=sub.id,
         user_id=sub.user_id,
-        plan=PlanResponse.model_validate(plan),
+        plan=plan_resp,
+        plan_slug=plan.slug if plan else "free",
+        plan_name=plan.name if plan else "Free Developer",
+        monthly_limit=plan.monthly_limit if plan else 1000,
+        rate_limit_rpm=plan.rate_limit_rpm if plan else 60,
         status=sub.status,
         current_period_start=sub.current_period_start,
         current_period_end=sub.current_period_end,
@@ -113,16 +118,51 @@ def get_user_subscription(
 
 
 @router.post("/checkout", response_model=CheckoutSessionResponse, summary="Create Stripe Checkout session")
+@router.post("/create-checkout-session", response_model=CheckoutSessionResponse, include_in_schema=False)
 def create_checkout_session(
     payload: CheckoutSessionRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Initiates a Stripe Checkout session to upgrade API key quota."""
-    if not settings.BILLING_ENABLED or not settings.STRIPE_SECRET_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Billing is currently in setup mode. Stripe keys must be configured in production environment.",
+    ensure_default_plans(db)
+
+    # Normalize plan slug
+    target_slug = (payload.plan_slug or "").lower().strip()
+    if target_slug == "developer":
+        target_slug = "pro"
+
+    plan = db.query(Plan).filter(Plan.slug == target_slug, Plan.is_active == True).first()
+    if not plan:
+        plan = db.query(Plan).filter(Plan.slug == payload.plan_slug, Plan.is_active == True).first()
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Selected plan '{payload.plan_slug}' not found.")
+
+    # In development mode (when Stripe keys are not yet configured), enable instant simulated upgrade
+    if settings.ENV == "development" and (not settings.BILLING_ENABLED or not settings.STRIPE_SECRET_KEY):
+        sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
+        if not sub:
+            sub = Subscription(
+                id=str(uuid.uuid4()),
+                user_id=current_user.id,
+                plan_id=plan.id,
+                status="active",
+            )
+            db.add(sub)
+        else:
+            sub.plan_id = plan.id
+            sub.status = "active"
+
+        # Sync user's active API keys to the new plan quota & rate limits!
+        db.query(ApiKey).filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True).update(
+            {"tier": plan.slug, "monthly_limit": plan.monthly_limit, "rate_limit_rpm": plan.rate_limit_rpm},
+            synchronize_session=False,
+        )
+        db.commit()
+
+        return CheckoutSessionResponse(
+            checkout_url=payload.success_url or f"/dashboard?upgrade_success={plan.slug}",
+            session_id=f"simulated_sub_{uuid.uuid4().hex[:12]}",
         )
 
     try:
@@ -134,10 +174,6 @@ def create_checkout_session(
             detail="Stripe SDK is not installed on the server.",
         )
 
-    plan = db.query(Plan).filter(Plan.slug == payload.plan_slug, Plan.is_active == True).first()
-    if not plan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Selected plan not found.")
-
     if plan.price_cents == 0 or not plan.stripe_price_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -145,7 +181,7 @@ def create_checkout_session(
         )
 
     success_url = payload.success_url or "https://lotsofnetwork.com/developer?session_id={CHECKOUT_SESSION_ID}"
-    cancel_url = payload.cancel_url or "https://lotsofnetwork.com/developer/pricing"
+    cancel_url = payload.cancel_url or "https://lotsofnetwork.com/developer"
 
     try:
         session = stripe.checkout.Session.create(
@@ -167,12 +203,15 @@ def create_checkout_session(
 
 
 @router.post("/portal", response_model=CustomerPortalResponse, summary="Create Stripe Customer Portal session")
+@router.post("/customer-portal", response_model=CustomerPortalResponse, include_in_schema=False)
 def create_customer_portal(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Generates a billing portal link for users to update or cancel their subscription."""
     if not settings.BILLING_ENABLED or not settings.STRIPE_SECRET_KEY:
+        if settings.ENV in ("development", "test"):
+            return CustomerPortalResponse(portal_url="/dashboard?portal=development_mode")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Billing is currently in setup mode.",
@@ -189,6 +228,8 @@ def create_customer_portal(
 
     sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
     if not sub or not sub.stripe_customer_id:
+        if settings.ENV in ("development", "test"):
+            return CustomerPortalResponse(portal_url="/dashboard?portal=development_mode")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No active Stripe customer found for this account.",
