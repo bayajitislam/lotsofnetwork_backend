@@ -17,6 +17,8 @@ from app.schemas.billing import (
     CheckoutSessionRequest,
     CheckoutSessionResponse,
     CustomerPortalResponse,
+    VerifySessionRequest,
+    VerifySessionResponse,
 )
 
 router = APIRouter(prefix="/billing", tags=["Billing & Monetisation"])
@@ -100,6 +102,47 @@ def get_user_subscription(
         db.add(sub)
         db.commit()
         db.refresh(sub)
+
+    # Auto-sync with Stripe if user has an active Stripe customer or subscription
+    if settings.BILLING_ENABLED and settings.STRIPE_SECRET_KEY:
+        try:
+            import stripe
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            customer_id = sub.stripe_customer_id
+            if not customer_id and current_user.email:
+                cust_res = stripe.Customer.list(email=current_user.email, limit=1)
+                if cust_res.data:
+                    customer_id = cust_res.data[0].id
+                    sub.stripe_customer_id = customer_id
+                    db.commit()
+
+            if customer_id:
+                sub_res = stripe.Subscription.list(customer=customer_id, status="active", limit=1)
+                if sub_res.data:
+                    active_stripe_sub = sub_res.data[0]
+                    sub.stripe_subscription_id = active_stripe_sub.id
+                    items = active_stripe_sub.get("items", {}).get("data", [])
+                    amount = 0
+                    if items:
+                        amount = items[0].get("price", {}).get("unit_amount", 0) or 0
+
+                    target_plan = None
+                    if amount >= 9000:
+                        target_plan = db.query(Plan).filter(Plan.slug == "enterprise").first()
+                    else:
+                        target_plan = db.query(Plan).filter(Plan.slug == "pro").first()
+
+                    if target_plan and sub.plan_id != target_plan.id:
+                        sub.plan_id = target_plan.id
+                        sub.status = "active"
+                        db.query(ApiKey).filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True).update(
+                            {"tier": target_plan.slug, "monthly_limit": target_plan.monthly_limit, "rate_limit_rpm": target_plan.rate_limit_rpm},
+                            synchronize_session=False,
+                        )
+                        db.commit()
+                        db.refresh(sub)
+        except Exception as exc:
+            pass
 
     plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
     plan_resp = PlanResponse.model_validate(plan) if plan else None
@@ -308,6 +351,104 @@ def create_customer_portal(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to generate portal session: {str(exc)}",
         )
+
+
+@router.post("/verify-session", response_model=VerifySessionResponse, summary="Verify and activate completed Stripe Checkout session")
+def verify_checkout_session(
+    payload: VerifySessionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Verifies a completed Stripe checkout session and immediately applies the plan upgrade.
+    Ensures instant plan activation even when webhooks cannot reach localhost.
+    """
+    ensure_default_plans(db)
+    session_id = payload.session_id.strip()
+    if not session_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="session_id is required")
+
+    # Handle simulated dev session or free tier:
+    if session_id.startswith("simulated_") or session_id.startswith("free_") or session_id.startswith("dev_"):
+        sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
+        plan = db.query(Plan).filter(Plan.id == sub.plan_id).first() if sub else None
+        return VerifySessionResponse(
+            status="success",
+            message="Subscription active",
+            plan_slug=plan.slug if plan else "free",
+            plan_name=plan.name if plan else "Free Developer",
+        )
+
+    if not settings.STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Stripe is not configured")
+
+    try:
+        import stripe
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        checkout_sess = stripe.checkout.Session.retrieve(session_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to retrieve checkout session from Stripe: {str(exc)}",
+        )
+
+    # Verify session completion / payment
+    is_paid = checkout_sess.payment_status in ("paid", "no_payment_required") or checkout_sess.status in ("complete", "paid")
+    if not is_paid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Checkout session is not paid (status: {checkout_sess.status})",
+        )
+
+    # Resolve target plan
+    plan_id = (checkout_sess.metadata or {}).get("plan_id")
+    plan_slug = (checkout_sess.metadata or {}).get("plan_slug")
+    plan = None
+    if plan_id:
+        plan = db.query(Plan).filter(Plan.id == plan_id).first()
+    if not plan and plan_slug:
+        plan = db.query(Plan).filter(Plan.slug == plan_slug).first()
+    if not plan:
+        plan = db.query(Plan).filter(Plan.slug == "pro").first()
+
+    customer_id = checkout_sess.customer
+    subscription_id = checkout_sess.subscription
+
+    sub = db.query(Subscription).filter(Subscription.user_id == current_user.id).first()
+    if not sub:
+        sub = Subscription(
+            id=str(uuid.uuid4()),
+            user_id=current_user.id,
+            plan_id=plan.id if plan else "pro",
+            stripe_customer_id=customer_id,
+            stripe_subscription_id=subscription_id,
+            status="active",
+        )
+        db.add(sub)
+    else:
+        if plan:
+            sub.plan_id = plan.id
+        if customer_id:
+            sub.stripe_customer_id = customer_id
+        if subscription_id:
+            sub.stripe_subscription_id = subscription_id
+        sub.status = "active"
+
+    # Sync active API keys to the new plan quota and RPM!
+    if plan:
+        db.query(ApiKey).filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True).update(
+            {"tier": plan.slug, "monthly_limit": plan.monthly_limit, "rate_limit_rpm": plan.rate_limit_rpm},
+            synchronize_session=False,
+        )
+    db.commit()
+    db.refresh(sub)
+
+    return VerifySessionResponse(
+        status="success",
+        message=f"Successfully upgraded to {plan.name if plan else 'new tier'}!",
+        plan_slug=plan.slug if plan else "pro",
+        plan_name=plan.name if plan else "Developer Tier",
+    )
 
 
 @router.post("/webhook", summary="Stripe Webhook Receiver")

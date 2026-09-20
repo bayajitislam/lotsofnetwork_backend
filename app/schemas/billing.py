@@ -45,3 +45,14 @@ class CheckoutSessionResponse(BaseModel):
 
 class CustomerPortalResponse(BaseModel):
     portal_url: str
+
+
+class VerifySessionRequest(BaseModel):
+    session_id: str
+
+
+class VerifySessionResponse(BaseModel):
+    status: str
+    message: str
+    plan_slug: str
+    plan_name: str
